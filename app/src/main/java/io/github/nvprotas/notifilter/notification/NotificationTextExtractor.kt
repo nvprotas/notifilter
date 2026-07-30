@@ -62,8 +62,8 @@ object NotificationTextExtractor {
             addText(extras.getCharSequence(Notification.EXTRA_INFO_TEXT))
             extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)
                 ?.take(MAX_TEXT_LINES)
-                ?.forEach(::addText)
-            notification.tickerText?.let(::addText)
+                ?.forEach { line -> addText(line) }
+            notification.tickerText?.let { ticker -> addText(ticker) }
         }.distinct().take(MAX_BODY_PARTS)
 
         return NotificationContent(
