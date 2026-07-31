@@ -86,6 +86,9 @@ crash-reporting. Backup и перенос данных запрошены как
 
 Подробная политика: [docs/PRIVACY.md](docs/PRIVACY.md).
 
+Инструкция по резервированию release-ключа, загрузке секретов через `gh` и
+получению подписанных APK/AAB: [docs/RELEASE_SIGNING.md](docs/RELEASE_SIGNING.md).
+
 ## Структура
 
 - `domain/RuleMatcher.kt` — чистый и тестируемый движок правил;

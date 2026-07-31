@@ -1,0 +1,230 @@
+name: Signed Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      sign_release:
+        description: Sign APK and AAB with the protected release key
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: signed-release
+  cancel-in-progress: false
+
+jobs:
+  build-unsigned:
+    name: Build and verify unsigned release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Refuse signing outside master
+        if: ${{ inputs.sign_release && github.ref != 'refs/heads/master' }}
+        run: |
+          echo "::error::Signed releases are allowed only from refs/heads/master"
+          exit 1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+      - name: Install Android SDK 36
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+      - uses: gradle/actions/wrapper-validation@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+        with:
+          cache-read-only: true
+      - name: Make Gradle wrapper executable
+        run: chmod +x gradlew
+      - name: Test, lint and build unsigned APK and AAB
+        run: ./gradlew test lintDebug lintRelease assembleRelease bundleRelease --no-daemon --stacktrace
+      - name: Stage unsigned release
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk_path="app/build/outputs/apk/release/app-release-unsigned.apk"
+          aab_path="app/build/outputs/bundle/release/app-release.aab"
+          test -f "$apk_path"
+          test -f "$aab_path"
+          mkdir -p release-input
+          cp "$apk_path" release-input/notifilter-unsigned.apk
+          cp "$aab_path" release-input/notifilter-unsigned.aab
+          sha256sum \
+            release-input/notifilter-unsigned.apk \
+            release-input/notifilter-unsigned.aab \
+            > release-input/SHA256SUMS
+      - name: Upload unsigned release for isolated signing
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: notifilter-release-unsigned
+          path: release-input/
+          if-no-files-found: error
+          retention-days: 1
+
+  sign-release:
+    name: Sign release in protected environment
+    if: ${{ inputs.sign_release && github.ref == 'refs/heads/master' }}
+    needs: build-unsigned
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: release-signing
+    steps:
+      # This job deliberately has no checkout and never runs Gradle or project code.
+      - name: Download verified unsigned release
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: notifilter-release-unsigned
+          path: release-input
+      - uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Prepare trusted signing tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v sdkmanager
+          command -v jarsigner
+          command -v keytool
+          sdkmanager "build-tools;35.0.0"
+          test -x "$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          test -x "$ANDROID_HOME/build-tools/35.0.0/zipalign"
+          sha256sum --check release-input/SHA256SUMS
+      - name: Restore key, sign and verify
+        shell: bash
+        env:
+          ANDROID_SIGNING_KEYSTORE_BASE64: ${{ secrets.ANDROID_SIGNING_KEYSTORE_BASE64 }}
+          ANDROID_SIGNING_STORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_STORE_PASSWORD }}
+          ANDROID_SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}
+          ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
+          EXPECTED_CERT_SHA256: ${{ vars.ANDROID_SIGNING_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          for required_name in \
+            ANDROID_SIGNING_KEYSTORE_BASE64 \
+            ANDROID_SIGNING_STORE_PASSWORD \
+            ANDROID_SIGNING_KEY_ALIAS \
+            ANDROID_SIGNING_KEY_PASSWORD \
+            EXPECTED_CERT_SHA256
+          do
+            if [ -z "${!required_name}" ]; then
+              echo "::error::Missing release-signing value: ${required_name}"
+              exit 1
+            fi
+          done
+
+          normalize_fingerprint() {
+            printf '%s' "$1" | tr -cd '[:xdigit:]' | tr '[:lower:]' '[:upper:]'
+          }
+
+          expected_cert_sha256="$(normalize_fingerprint "$EXPECTED_CERT_SHA256")"
+          if [ "${#expected_cert_sha256}" -ne 64 ]; then
+            echo "::error::ANDROID_SIGNING_CERT_SHA256 is not a SHA-256 fingerprint"
+            exit 1
+          fi
+
+          keystore_path="$RUNNER_TEMP/notifilter-release.jks"
+          trap 'rm -f "$keystore_path"' EXIT
+          printf '%s' "$ANDROID_SIGNING_KEYSTORE_BASE64" \
+            | base64 --decode > "$keystore_path"
+
+          mkdir -p release-output
+          zipalign="$ANDROID_HOME/build-tools/35.0.0/zipalign"
+          apksigner="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+
+          "$zipalign" -p -f 4 \
+            release-input/notifilter-unsigned.apk \
+            release-output/notifilter-aligned.apk
+          "$apksigner" sign \
+            --ks "$keystore_path" \
+            --ks-type JKS \
+            --ks-key-alias "$ANDROID_SIGNING_KEY_ALIAS" \
+            --ks-pass env:ANDROID_SIGNING_STORE_PASSWORD \
+            --key-pass env:ANDROID_SIGNING_KEY_PASSWORD \
+            --v4-signing-enabled false \
+            --out release-output/notifilter-release.apk \
+            release-output/notifilter-aligned.apk
+          rm -f release-output/notifilter-aligned.apk
+
+          jarsigner \
+            -keystore "$keystore_path" \
+            -storetype JKS \
+            -storepass:env ANDROID_SIGNING_STORE_PASSWORD \
+            -keypass:env ANDROID_SIGNING_KEY_PASSWORD \
+            -sigalg SHA256withRSA \
+            -digestalg SHA-256 \
+            -signedjar release-output/notifilter-release.aab \
+            release-input/notifilter-unsigned.aab \
+            "$ANDROID_SIGNING_KEY_ALIAS"
+
+          rm -f "$keystore_path"
+          trap - EXIT
+
+          "$apksigner" verify --verbose --print-certs \
+            release-output/notifilter-release.apk \
+            > release-output/apk-signing-certificate.txt
+          apk_cert_lines="$(sed -n \
+            's/^Signer #[0-9][0-9]* certificate SHA-256 digest: //p' \
+            release-output/apk-signing-certificate.txt)"
+          apk_cert_count="$(printf '%s\n' "$apk_cert_lines" | sed '/^$/d' | wc -l)"
+          if [ "$apk_cert_count" -ne 1 ]; then
+            echo "::error::Expected exactly one APK signer, found ${apk_cert_count}"
+            exit 1
+          fi
+          apk_cert_sha256="$(normalize_fingerprint "$apk_cert_lines")"
+
+          jarsigner -verify -verbose -certs \
+            release-output/notifilter-release.aab \
+            > release-output/aab-signature-verification.txt 2>&1
+          if ! grep -q 'jar verified\.' release-output/aab-signature-verification.txt; then
+            echo "::error::AAB signature verification did not report success"
+            exit 1
+          fi
+          if grep -Eqi 'jar is unsigned|unsigned entries|unsigned entry' \
+            release-output/aab-signature-verification.txt
+          then
+            echo "::error::AAB contains unsigned entries"
+            exit 1
+          fi
+          keytool -printcert -jarfile release-output/notifilter-release.aab \
+            > release-output/aab-signing-certificate.txt
+          aab_cert_sha256="$(sed -n \
+            's/^[[:space:]]*SHA256:[[:space:]]*//p' \
+            release-output/aab-signing-certificate.txt \
+            | head -n 1)"
+          aab_cert_sha256="$(normalize_fingerprint "$aab_cert_sha256")"
+
+          if [ "$apk_cert_sha256" != "$expected_cert_sha256" ]; then
+            echo "::error::APK certificate does not match ANDROID_SIGNING_CERT_SHA256"
+            exit 1
+          fi
+          if [ "$aab_cert_sha256" != "$expected_cert_sha256" ]; then
+            echo "::error::AAB certificate does not match ANDROID_SIGNING_CERT_SHA256"
+            exit 1
+          fi
+
+          pushd release-output > /dev/null
+          sha256sum notifilter-release.apk notifilter-release.aab > SHA256SUMS
+          popd > /dev/null
+      - name: Remove signing keystore
+        if: always()
+        shell: bash
+        run: |
+          keystore_path="$RUNNER_TEMP/notifilter-release.jks"
+          if [ -f "$keystore_path" ]; then
+            shred --remove "$keystore_path" || rm -f "$keystore_path"
+          fi
+      - name: Upload signed release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: notifilter-release-signed
+          path: release-output/
+          if-no-files-found: error
+          retention-days: 30
