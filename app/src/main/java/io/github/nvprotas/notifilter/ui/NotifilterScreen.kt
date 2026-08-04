@@ -1,5 +1,7 @@
 package io.github.nvprotas.notifilter.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -49,6 +51,9 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -88,7 +93,17 @@ fun NotifilterScreen(
     val activeNotifications by viewModel.activeNotifications.collectAsStateWithLifecycle()
     val journalEnabled by viewModel.journalEnabled.collectAsStateWithLifecycle()
     val journalEntries by viewModel.journalEntries.collectAsStateWithLifecycle()
+    val ruleImportPreview by viewModel.ruleImportPreview.collectAsStateWithLifecycle()
+    val backupOperationInProgress by viewModel.backupOperationInProgress.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
+    val exportRulesLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/json"),
+        onResult = { uri -> uri?.let(viewModel::exportRules) },
+    )
+    val importRulesLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+        onResult = { uri -> uri?.let(viewModel::prepareRuleImport) },
+    )
 
     var selectedSection by rememberSaveable { mutableStateOf(MainSection.RULES) }
     var creatingRule by remember { mutableStateOf(false) }
@@ -116,7 +131,12 @@ fun NotifilterScreen(
                 }
             }
         },
-        snackbarHost = { SnackbarHost(snackbarHostState) },
+        snackbarHost = {
+            SnackbarHost(
+                hostState = snackbarHostState,
+                modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+            )
+        },
         floatingActionButton = {
             if (selectedSection == MainSection.RULES) {
                 ExtendedFloatingActionButton(
@@ -162,6 +182,24 @@ fun NotifilterScreen(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
+                }
+
+                item {
+                    RuleBackupCard(
+                        operationInProgress = backupOperationInProgress,
+                        onExport = { exportRulesLauncher.launch("notifilter-rules.json") },
+                        onImport = {
+                            importRulesLauncher.launch(
+                                arrayOf(
+                                    "application/json",
+                                    "text/json",
+                                    "text/plain",
+                                    "application/octet-stream",
+                                ),
+                            )
+                        },
+                        modifier = Modifier.padding(horizontal = 16.dp),
+                    )
                 }
 
                 if (rules.isEmpty()) {
@@ -236,7 +274,127 @@ fun NotifilterScreen(
             },
         )
     }
+
+    ruleImportPreview?.let { preview ->
+        RuleImportDialog(
+            preview = preview,
+            operationInProgress = backupOperationInProgress,
+            onAdd = { viewModel.confirmRuleImport(RuleImportMode.ADD) },
+            onReplace = { viewModel.confirmRuleImport(RuleImportMode.REPLACE) },
+            onDismiss = viewModel::dismissRuleImport,
+        )
+    }
 }
+
+@Composable
+private fun RuleBackupCard(
+    operationInProgress: Boolean,
+    onExport: () -> Unit,
+    onImport: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Card(modifier = modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(
+                text = "Резервная копия правил",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                text = "Сохраните правила в JSON перед удалением приложения или переносом на другое устройство.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            OutlinedButton(
+                onClick = onExport,
+                enabled = !operationInProgress,
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("Экспортировать правила") }
+            OutlinedButton(
+                onClick = onImport,
+                enabled = !operationInProgress,
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("Импортировать правила") }
+            if (operationInProgress) {
+                Text(
+                    text = "Обрабатываем файл…",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun RuleImportDialog(
+    preview: RuleImportPreview,
+    operationInProgress: Boolean,
+    onAdd: () -> Unit,
+    onReplace: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = { if (!operationInProgress) onDismiss() },
+        title = { Text("Импортировать правила?") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("В резервной копии: ${preview.importedRuleCount}")
+                Text("Текущих правил: ${preview.currentRuleCount}")
+                if (preview.duplicateCount > 0) {
+                    Text(
+                        ruleImportDuplicateMessage(preview.duplicateCount),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Text("Добавление сохранит текущие правила и добавит только новые.")
+                Text(
+                    ruleImportReplacementMessage(preview.currentRuleCount),
+                    color = MaterialTheme.colorScheme.error,
+                )
+                if (operationInProgress) {
+                    Text(
+                        text = "Импортируем правила…",
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalAlignment = Alignment.End,
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Button(
+                    onClick = onAdd,
+                    enabled = !operationInProgress,
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Добавить правила") }
+                OutlinedButton(
+                    onClick = onReplace,
+                    enabled = !operationInProgress,
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Заменить все правила") }
+                TextButton(
+                    onClick = onDismiss,
+                    enabled = !operationInProgress,
+                ) { Text("Отмена") }
+            }
+        },
+    )
+}
+
+internal fun ruleImportDuplicateMessage(duplicateCount: Int): String =
+    "При добавлении будет пропущено дубликатов: $duplicateCount"
+
+internal fun ruleImportReplacementMessage(currentRuleCount: Int): String =
+    "Замена удалит $currentRuleCount текущих правил и восстановит правила из файла."
 
 @Composable
 private fun JournalContent(

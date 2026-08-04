@@ -2,18 +2,25 @@ package io.github.nvprotas.notifilter.ui
 
 import android.app.Application
 import android.content.Intent
+import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import io.github.nvprotas.notifilter.data.AppDatabase
 import io.github.nvprotas.notifilter.data.BlockedNotificationEntity
 import io.github.nvprotas.notifilter.data.JournalOperationCoordinator
+import io.github.nvprotas.notifilter.data.RuleBackup
+import io.github.nvprotas.notifilter.data.RuleBackupCodec
+import io.github.nvprotas.notifilter.data.RuleBackupError
+import io.github.nvprotas.notifilter.data.RuleBackupException
 import io.github.nvprotas.notifilter.data.RuleRepository
 import io.github.nvprotas.notifilter.data.UserPreferences
+import io.github.nvprotas.notifilter.data.functionalKey
 import io.github.nvprotas.notifilter.domain.ActiveNotificationsState
 import io.github.nvprotas.notifilter.domain.FilterRule
 import io.github.nvprotas.notifilter.domain.RulePreviewEvaluator
 import io.github.nvprotas.notifilter.domain.RulePreviewResult
 import io.github.nvprotas.notifilter.notification.ActiveNotificationCoordinator
+import java.io.IOException
 import java.text.Collator
 import java.util.Locale
 import kotlinx.coroutines.CancellationException
@@ -28,6 +35,17 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+
+data class RuleImportPreview(
+    val importedRuleCount: Int,
+    val currentRuleCount: Int,
+    val duplicateCount: Int,
+)
+
+enum class RuleImportMode {
+    ADD,
+    REPLACE,
+}
 
 class RulesViewModel(application: Application) : AndroidViewModel(application) {
     private val database = AppDatabase.get(application)
@@ -63,6 +81,13 @@ class RulesViewModel(application: Application) : AndroidViewModel(application) {
     private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 1)
     val messages = _messages.asSharedFlow()
 
+    private var pendingRuleImport: RuleBackup? = null
+    private val _ruleImportPreview = MutableStateFlow<RuleImportPreview?>(null)
+    val ruleImportPreview: StateFlow<RuleImportPreview?> = _ruleImportPreview
+
+    private val _backupOperationInProgress = MutableStateFlow(false)
+    val backupOperationInProgress: StateFlow<Boolean> = _backupOperationInProgress
+
     init {
         loadInstalledApps()
         pruneJournal()
@@ -79,6 +104,103 @@ class RulesViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             runCatching { repository.delete(rule) }
                 .onFailure { _messages.emit("Не удалось удалить правило") }
+        }
+    }
+
+    fun exportRules(uri: Uri) {
+        if (_backupOperationInProgress.value) return
+        _backupOperationInProgress.value = true
+        viewModelScope.launch {
+            try {
+                val exportedCount = withContext(Dispatchers.IO) {
+                    val rulesToExport = repository.exportRules()
+                    val bytes = RuleBackupCodec.encode(rulesToExport)
+                    val resolver = getApplication<Application>().contentResolver
+                    resolver.openOutputStream(uri, "wt")?.use { output ->
+                        output.write(bytes)
+                        output.flush()
+                    } ?: throw IOException("Unable to open export document")
+                    rulesToExport.size
+                }
+                _messages.emit("Экспортировано правил: $exportedCount")
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Throwable) {
+                _messages.emit("Не удалось экспортировать правила. Выберите другой файл и повторите.")
+            } finally {
+                _backupOperationInProgress.value = false
+            }
+        }
+    }
+
+    fun prepareRuleImport(uri: Uri) {
+        if (_backupOperationInProgress.value) return
+        pendingRuleImport = null
+        _ruleImportPreview.value = null
+        _backupOperationInProgress.value = true
+        viewModelScope.launch {
+            try {
+                val prepared = withContext(Dispatchers.IO) {
+                    val resolver = getApplication<Application>().contentResolver
+                    val backup = resolver.openInputStream(uri)?.use { input ->
+                        RuleBackupCodec.decode(input)
+                    }
+                        ?: throw IOException("Unable to open import document")
+                    val currentRules = repository.exportRules()
+                    PreparedRuleImport(
+                        backup = backup,
+                        preview = buildRuleImportPreview(currentRules, backup.rules),
+                    )
+                }
+                pendingRuleImport = prepared.backup
+                _ruleImportPreview.value = prepared.preview
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                _messages.emit(ruleImportErrorMessage(error))
+            } finally {
+                _backupOperationInProgress.value = false
+            }
+        }
+    }
+
+    fun dismissRuleImport() {
+        if (_backupOperationInProgress.value) return
+        pendingRuleImport = null
+        _ruleImportPreview.value = null
+    }
+
+    fun confirmRuleImport(mode: RuleImportMode) {
+        if (_backupOperationInProgress.value) return
+        val backup = pendingRuleImport ?: return
+        _backupOperationInProgress.value = true
+        viewModelScope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    when (mode) {
+                        RuleImportMode.ADD -> repository.addImportedRules(backup.rules)
+                        RuleImportMode.REPLACE -> repository.replaceRules(backup.rules)
+                    }
+                }
+                pendingRuleImport = null
+                _ruleImportPreview.value = null
+                val message = when (mode) {
+                    RuleImportMode.ADD -> if (result.skipped > 0) {
+                        "Добавлено правил: ${result.imported}. Пропущено дубликатов: ${result.skipped}."
+                    } else {
+                        "Добавлено правил: ${result.imported}"
+                    }
+
+                    RuleImportMode.REPLACE -> "Восстановлено правил: ${result.imported}"
+                }
+                _messages.emit(message)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Throwable) {
+                _messages.emit("Не удалось импортировать правила. Текущие правила не изменены.")
+            } finally {
+                _backupOperationInProgress.value = false
+            }
         }
     }
 
@@ -206,4 +328,43 @@ class RulesViewModel(application: Application) : AndroidViewModel(application) {
     companion object {
         private const val PREVIEW_DEBOUNCE_MILLIS = 180L
     }
+}
+
+private data class PreparedRuleImport(
+    val backup: RuleBackup,
+    val preview: RuleImportPreview,
+)
+
+internal fun buildRuleImportPreview(
+    currentRules: List<FilterRule>,
+    importedRules: List<FilterRule>,
+): RuleImportPreview {
+    val knownKeys = currentRules.mapTo(mutableSetOf()) { it.functionalKey() }
+    val addableCount = importedRules.count { knownKeys.add(it.functionalKey()) }
+    return RuleImportPreview(
+        importedRuleCount = importedRules.size,
+        currentRuleCount = currentRules.size,
+        duplicateCount = importedRules.size - addableCount,
+    )
+}
+
+internal fun ruleImportErrorMessage(error: Throwable): String = when (error) {
+    is RuleBackupException -> when (error.error) {
+        RuleBackupError.UNSUPPORTED_FORMAT ->
+            "Это не резервная копия правил Notifilter."
+
+        RuleBackupError.UNSUPPORTED_VERSION ->
+            "Версия резервной копии ${error.declaredVersion ?: "?"} не поддерживается."
+
+        RuleBackupError.TOO_LARGE,
+        RuleBackupError.TOO_MANY_RULES -> "Резервная копия слишком большая для импорта."
+
+        RuleBackupError.INVALID_RULE ->
+            "Правило ${error.ruleNumber ?: "?"} в резервной копии содержит недопустимые данные."
+
+        RuleBackupError.MALFORMED_DOCUMENT ->
+            "Не удалось прочитать файл. Выберите резервную копию правил Notifilter."
+    }
+
+    else -> "Не удалось открыть резервную копию. Выберите другой файл и повторите."
 }
