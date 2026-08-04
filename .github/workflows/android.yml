@@ -3,6 +3,10 @@ name: Android CI
 on:
   workflow_dispatch:
   push:
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "openspec/**"
   pull_request:
 
 permissions:
