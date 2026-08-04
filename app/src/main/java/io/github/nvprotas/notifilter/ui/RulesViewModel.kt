@@ -9,11 +9,16 @@ import io.github.nvprotas.notifilter.data.BlockedNotificationEntity
 import io.github.nvprotas.notifilter.data.JournalOperationCoordinator
 import io.github.nvprotas.notifilter.data.RuleRepository
 import io.github.nvprotas.notifilter.data.UserPreferences
+import io.github.nvprotas.notifilter.domain.ActiveNotificationsState
 import io.github.nvprotas.notifilter.domain.FilterRule
+import io.github.nvprotas.notifilter.domain.RulePreviewEvaluator
+import io.github.nvprotas.notifilter.domain.RulePreviewResult
+import io.github.nvprotas.notifilter.notification.ActiveNotificationCoordinator
 import java.text.Collator
 import java.util.Locale
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -43,6 +48,8 @@ class RulesViewModel(application: Application) : AndroidViewModel(application) {
     )
     val filteringEnabled: StateFlow<Boolean> = preferences.filteringEnabled
     val journalEnabled: StateFlow<Boolean> = preferences.journalEnabled
+    val activeNotifications: StateFlow<ActiveNotificationsState> =
+        ActiveNotificationCoordinator.state
     val journalEntries: StateFlow<List<BlockedNotificationEntity>> =
         journalDao.observeSince(System.currentTimeMillis() - journalRetentionMillis()).stateIn(
             scope = viewModelScope,
@@ -81,6 +88,25 @@ class RulesViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setFilteringEnabled(enabled: Boolean) {
         preferences.setFilteringEnabled(enabled)
+    }
+
+    suspend fun previewRule(
+        savedRules: List<FilterRule>,
+        existingRule: FilterRule?,
+        draft: FilterRule,
+        filteringEnabled: Boolean,
+        activeState: ActiveNotificationsState,
+    ): RulePreviewResult {
+        delay(PREVIEW_DEBOUNCE_MILLIS)
+        return withContext(Dispatchers.Default) {
+            RulePreviewEvaluator.evaluate(
+                savedRules = savedRules,
+                existingRule = existingRule,
+                draft = draft,
+                filteringEnabled = filteringEnabled,
+                activeState = activeState,
+            )
+        }
     }
 
     fun setJournalEnabled(enabled: Boolean) {
@@ -176,4 +202,8 @@ class RulesViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun journalRetentionMillis(): Long =
         UserPreferences.JOURNAL_RETENTION_DAYS * 24L * 60L * 60L * 1_000L
+
+    companion object {
+        private const val PREVIEW_DEBOUNCE_MILLIS = 180L
+    }
 }

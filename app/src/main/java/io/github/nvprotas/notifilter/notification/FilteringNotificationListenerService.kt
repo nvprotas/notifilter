@@ -12,25 +12,37 @@ import io.github.nvprotas.notifilter.data.JournalOperationCoordinator
 import io.github.nvprotas.notifilter.data.JournalStatus
 import io.github.nvprotas.notifilter.data.UserPreferences
 import io.github.nvprotas.notifilter.data.toDomain
+import io.github.nvprotas.notifilter.domain.ActiveNotificationSample
+import io.github.nvprotas.notifilter.domain.FilterDecision
+import io.github.nvprotas.notifilter.domain.FilterRule
 import io.github.nvprotas.notifilter.domain.RuleMatcher
 import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.retryWhen
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.withLock
 
 class FilteringNotificationListenerService : NotificationListenerService() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val matcher = AtomicReference(RuleMatcher.EMPTY)
-    private val pendingCancellations = ConcurrentHashMap<String, PendingCancellation>()
+    private val matcherState = AtomicReference(MatcherState(revision = 0L, matcher = RuleMatcher.EMPTY))
+    private val matcherUpdateLock = Any()
+    private val refilterGeneration = RefilterGenerationTracker()
+    private val refilterJobLock = Any()
+    private var refilterJob: Job? = null
+    private val pendingCancellations = InFlightCancellationRegistry<PendingCancellation> {
+        it.createdAtElapsed
+    }
+    private val listenerConnected = AtomicBoolean(false)
 
     private lateinit var preferences: UserPreferences
     private val journalDao by lazy {
@@ -45,7 +57,7 @@ class FilteringNotificationListenerService : NotificationListenerService() {
         val dao = AppDatabase.get(applicationContext).filterRuleDao()
         serviceScope.launch {
             try {
-                matcher.set(RuleMatcher.compile(dao.getEnabled().map { it.toDomain() }))
+                updateMatcher(dao.getEnabled().map { it.toDomain() })
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Throwable) {
@@ -63,7 +75,7 @@ class FilteringNotificationListenerService : NotificationListenerService() {
                     true
                 }
                 .collect { entities ->
-                    matcher.set(RuleMatcher.compile(entities.map { it.toDomain() }))
+                    updateMatcher(entities.map { it.toDomain() })
                 }
         }
 
@@ -82,71 +94,126 @@ class FilteringNotificationListenerService : NotificationListenerService() {
             while (true) {
                 delay(PENDING_CLEANUP_INTERVAL_MILLIS)
                 val cutoff = SystemClock.elapsedRealtime() - PENDING_EXPIRY_MILLIS
-                pendingCancellations.entries.removeIf { it.value.createdAtElapsed < cutoff }
+                pendingCancellations.pruneOlderThan(cutoff)
+            }
+        }
+
+        serviceScope.launch {
+            preferences.filteringEnabled.collect {
+                scheduleRefilter()
             }
         }
     }
 
     override fun onNotificationPosted(notification: StatusBarNotification?) {
         val posted = notification ?: return
-        if (!preferences.isFilteringEnabled()) return
-        if (!isSafeToFilter(posted)) return
+        refreshActiveNotificationState(postedOverride = posted)
+        evaluateAndCancel(posted)
+    }
 
+    private fun updateMatcher(rules: List<FilterRule>) {
+        val generation = synchronized(matcherUpdateLock) {
+            val previous = matcherState.get()
+            matcherState.set(
+                MatcherState(
+                    revision = previous.revision + 1L,
+                    matcher = RuleMatcher.compile(rules),
+                ),
+            )
+            refilterGeneration.next()
+        }
+        launchRefilter(generation)
+    }
+
+    private fun scheduleRefilter() {
+        val generation = synchronized(matcherUpdateLock) {
+            refilterGeneration.next()
+        }
+        launchRefilter(generation)
+    }
+
+    private fun launchRefilter(generation: Long) {
+        synchronized(refilterJobLock) {
+            refilterJob?.cancel()
+            refilterJob = serviceScope.launch {
+                reFilterActiveNotifications(generation)
+            }
+        }
+    }
+
+    private suspend fun reFilterActiveNotifications(generation: Long) {
+        if (!listenerConnected.get()) return
+        val active = readActiveNotifications() ?: return
+        publishActiveNotificationState(active)
+        if (!preferences.isFilteringEnabled()) return
+
+        active.forEach { posted ->
+            currentCoroutineContext().ensureActive()
+            if (!refilterGeneration.isCurrent(generation)) return
+            evaluateAndCancel(posted, expectedGeneration = generation)
+        }
+    }
+
+    private fun evaluateAndCancel(
+        posted: StatusBarNotification,
+        expectedGeneration: Long? = null,
+    ) {
         val content = NotificationTextExtractor.extract(
             packageName = posted.packageName,
             notification = posted.notification,
         )
-        val decision = matcher.get().evaluate(content)
-        if (decision.shouldBlock) {
-            val eventTime = System.currentTimeMillis()
-            val eventEpoch = JournalOperationCoordinator.currentEpoch()
-            val shouldSaveJournal = preferences.shouldSaveJournal() &&
-                JournalOperationCoordinator.canWrite(eventTime, eventEpoch)
-            var createdPending = false
-            val pending = if (shouldSaveJournal) {
-                val candidate = PendingCancellation(
-                    eventId = UUID.randomUUID().toString(),
-                    epoch = eventEpoch,
-                    createdAt = eventTime,
-                    createdAtElapsed = SystemClock.elapsedRealtime(),
-                )
-                pendingCancellations.compute(posted.key) { _, existing ->
-                    if (existing != null && existing.epoch == eventEpoch) {
-                        existing
-                    } else {
-                        createdPending = true
-                        candidate
-                    }
-                }
-            } else {
-                null
-            }
-            val journalSnapshot = if (createdPending) {
-                NotificationTextExtractor.journalSnapshot(posted.notification)
-            } else {
-                JournalSnapshot.EMPTY
-            }
-
-            runCatching { cancelNotification(posted.key) }
-                .onSuccess {
-                    if (createdPending && pending != null) {
-                        saveToJournal(
-                            packageName = posted.packageName,
-                            pending = pending,
-                            eventTime = pending.createdAt,
-                            snapshot = journalSnapshot,
-                            matchedRuleId = decision.matchedRuleId,
-                            matchedRulePattern = decision.matchedRulePattern.orEmpty(),
-                        )
-                    }
-                }
-                .onFailure { error ->
-                    if (createdPending && pending != null) {
-                        pendingCancellations.remove(posted.key, pending)
-                    }
-                    Log.w(TAG, "Unable to cancel notification", error)
-                }
+        synchronized(matcherUpdateLock) {
+            if (expectedGeneration != null && !refilterGeneration.isCurrent(expectedGeneration)) return
+            val decision = RuntimeNotificationFilter.blockedDecision(
+                content = content,
+                eligibleForFiltering = isSafeToFilter(posted),
+                filteringEnabled = preferences.isFilteringEnabled(),
+                matcher = matcherState.get().matcher,
+            ) ?: return
+            requestCancellation(posted, decision)
         }
+    }
+
+    private fun requestCancellation(
+        posted: StatusBarNotification,
+        decision: FilterDecision,
+    ) {
+        val eventTime = System.currentTimeMillis()
+        val eventEpoch = JournalOperationCoordinator.currentEpoch()
+        val shouldSaveJournal = preferences.shouldSaveJournal() &&
+            JournalOperationCoordinator.canWrite(eventTime, eventEpoch)
+        val pending = PendingCancellation(
+            eventId = UUID.randomUUID().toString(),
+            epoch = eventEpoch,
+            createdAt = eventTime,
+            createdAtElapsed = SystemClock.elapsedRealtime(),
+            saveJournal = shouldSaveJournal,
+        )
+        if (!pendingCancellations.tryStart(posted.key, pending)) return
+
+        val journalSnapshot = if (shouldSaveJournal) {
+            NotificationTextExtractor.journalSnapshot(posted.notification)
+        } else {
+            JournalSnapshot.EMPTY
+        }
+
+        runCatching { cancelNotification(posted.key) }
+            .onSuccess {
+                if (shouldSaveJournal) {
+                    saveToJournal(
+                        packageName = posted.packageName,
+                        pending = pending,
+                        eventTime = pending.createdAt,
+                        snapshot = journalSnapshot,
+                        matchedRuleId = decision.matchedRuleId,
+                        matchedRulePattern = decision.matchedRulePattern.orEmpty(),
+                    )
+                }
+            }
+            .onFailure { error ->
+                pendingCancellations.abandon(posted.key, pending)
+                Log.w(TAG, "Unable to cancel notification", error)
+            }
     }
 
     private fun saveToJournal(
@@ -196,10 +263,12 @@ class FilteringNotificationListenerService : NotificationListenerService() {
     ) {
         super.onNotificationRemoved(notification, rankingMap, reason)
         val removed = notification ?: return
+        refreshActiveNotificationState(removedKey = removed.key)
         if (reason != REASON_LISTENER_CANCEL) return
 
-        val pending = pendingCancellations.remove(removed.key) ?: return
+        val pending = pendingCancellations.finish(removed.key) ?: return
         pending.confirmed.set(true)
+        if (!pending.saveJournal) return
         JournalOperationCoordinator.scope.launch {
             runCatching {
                 JournalOperationCoordinator.mutex.withLock {
@@ -207,6 +276,63 @@ class FilteringNotificationListenerService : NotificationListenerService() {
                 }
             }.onFailure { error -> Log.w(TAG, "Unable to confirm journal entry", error) }
         }
+    }
+
+    override fun onListenerConnected() {
+        super.onListenerConnected()
+        listenerConnected.set(true)
+        refreshActiveNotificationState()
+        scheduleRefilter()
+    }
+
+    override fun onListenerDisconnected() {
+        listenerConnected.set(false)
+        synchronized(matcherUpdateLock) {
+            refilterGeneration.next()
+        }
+        synchronized(refilterJobLock) {
+            refilterJob?.cancel()
+            refilterJob = null
+        }
+        ActiveNotificationCoordinator.publishUnavailable()
+        super.onListenerDisconnected()
+    }
+
+    private fun refreshActiveNotificationState(
+        postedOverride: StatusBarNotification? = null,
+        removedKey: String? = null,
+    ) {
+        if (!listenerConnected.get()) return
+        val active = readActiveNotifications() ?: return
+        val byKey = active.associateByTo(LinkedHashMap()) { it.key }
+        postedOverride?.let { byKey[it.key] = it }
+        removedKey?.let(byKey::remove)
+        publishActiveNotificationState(byKey.values.toList())
+    }
+
+    private fun readActiveNotifications(): List<StatusBarNotification>? =
+        runCatching { activeNotifications?.toList().orEmpty() }
+            .onFailure { error -> Log.w(TAG, "Unable to read active notifications", error) }
+            .getOrElse {
+                ActiveNotificationCoordinator.publishUnavailable()
+                return null
+            }
+
+    private fun publishActiveNotificationState(active: List<StatusBarNotification>) {
+        val samples = active
+            .sortedByDescending { it.postTime }
+            .map { posted ->
+                ActiveNotificationSample(
+                    key = posted.key,
+                    content = NotificationTextExtractor.extract(
+                        packageName = posted.packageName,
+                        notification = posted.notification,
+                    ),
+                    postedAt = posted.postTime,
+                    eligibleForFiltering = isSafeToFilter(posted),
+                )
+            }
+        ActiveNotificationCoordinator.publishAvailable(samples)
     }
 
     private fun isSafeToFilter(posted: StatusBarNotification): Boolean {
@@ -238,6 +364,8 @@ class FilteringNotificationListenerService : NotificationListenerService() {
         UserPreferences.JOURNAL_RETENTION_DAYS * 24L * 60L * 60L * 1_000L
 
     override fun onDestroy() {
+        listenerConnected.set(false)
+        ActiveNotificationCoordinator.publishUnavailable()
         serviceScope.cancel()
         super.onDestroy()
     }
@@ -255,6 +383,12 @@ class FilteringNotificationListenerService : NotificationListenerService() {
         val epoch: Long,
         val createdAt: Long,
         val createdAtElapsed: Long,
+        val saveJournal: Boolean,
         val confirmed: AtomicBoolean = AtomicBoolean(false),
+    )
+
+    private data class MatcherState(
+        val revision: Long,
+        val matcher: RuleMatcher,
     )
 }

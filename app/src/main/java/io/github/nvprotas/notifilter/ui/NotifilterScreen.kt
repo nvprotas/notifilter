@@ -43,6 +43,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -57,13 +58,22 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.github.nvprotas.notifilter.data.BlockedNotificationEntity
 import io.github.nvprotas.notifilter.data.JournalStatus
 import io.github.nvprotas.notifilter.data.UserPreferences
+import io.github.nvprotas.notifilter.domain.ActiveNotificationsState
 import io.github.nvprotas.notifilter.domain.FilterRule
 import io.github.nvprotas.notifilter.domain.MatchTarget
-import io.github.nvprotas.notifilter.domain.NotificationContent
 import io.github.nvprotas.notifilter.domain.RuleAction
-import io.github.nvprotas.notifilter.domain.RuleMatcher
+import io.github.nvprotas.notifilter.domain.RulePreviewEntry
+import io.github.nvprotas.notifilter.domain.RulePreviewResult
 import java.text.DateFormat
 import java.util.Date
+
+private typealias RulePreviewLoader = suspend (
+    List<FilterRule>,
+    FilterRule?,
+    FilterRule,
+    Boolean,
+    ActiveNotificationsState,
+) -> RulePreviewResult
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -75,6 +85,7 @@ fun NotifilterScreen(
     val rules by viewModel.rules.collectAsStateWithLifecycle()
     val apps by viewModel.installedApps.collectAsStateWithLifecycle()
     val filteringEnabled by viewModel.filteringEnabled.collectAsStateWithLifecycle()
+    val activeNotifications by viewModel.activeNotifications.collectAsStateWithLifecycle()
     val journalEnabled by viewModel.journalEnabled.collectAsStateWithLifecycle()
     val journalEntries by viewModel.journalEntries.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
@@ -190,7 +201,11 @@ fun NotifilterScreen(
     if (creatingRule || editingRule != null) {
         RuleEditorDialog(
             existingRule = editingRule,
+            savedRules = rules,
             apps = apps,
+            filteringEnabled = filteringEnabled,
+            activeNotifications = activeNotifications,
+            loadPreview = viewModel::previewRule,
             onDismiss = {
                 creatingRule = false
                 editingRule = null
@@ -525,9 +540,9 @@ private fun AccessCard(
             Spacer(Modifier.height(6.dp))
             Text(
                 text = if (granted) {
-                    "Сервис в фоне проверяет текст всех доступных ему уведомлений, даже когда Notifilter закрыт. Журнал выключен по умолчанию; при отдельном включении видимые заголовок и основной текст сработавших уведомлений сохраняются только на устройстве."
+                    "Сервис в фоне проверяет текст доступных уведомлений. Редактор временно показывает активные push из системной шторки; они не сохраняются. Журнал выключен по умолчанию и записывает только скрытые уведомления после отдельного включения."
                 } else {
-                    "Android попросит разрешить сервису в фоне читать текст всех доступных ему уведомлений и удалять совпавшие, даже когда Notifilter закрыт. Журнал включается отдельно и хранится только на устройстве; данные никуда не отправляются."
+                    "Android попросит разрешить сервису читать активные уведомления, показывать их в предпросмотре и удалять совпавшие. Предпросмотр не сохраняется; журнал включается отдельно и хранится только на устройстве."
                 },
                 style = MaterialTheme.typography.bodyMedium,
             )
@@ -549,7 +564,7 @@ private fun MasterSwitchCard(
         Column(Modifier.padding(vertical = 6.dp)) {
             SettingSwitchRow(
                 title = "Фильтрация включена",
-                description = "Мгновенно остановить или возобновить все правила",
+                description = "При включении правила сразу применяются и к push, уже находящимся в шторке",
                 checked = enabled,
                 onCheckedChange = onEnabledChange,
             )
@@ -608,7 +623,7 @@ private fun EmptyRulesCard(modifier: Modifier = Modifier) {
             Text("Правил пока нет", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(4.dp))
             Text(
-                "Добавьте выражение вроде (?i)скидк[аи]|акци[яи], выберите приложение и проверьте его на тестовой строке.",
+                "Добавьте выражение вроде (?i)скидк[аи]|акци[яи]. Редактор покажет совпадения среди активных push до сохранения.",
                 style = MaterialTheme.typography.bodyMedium,
             )
         }
@@ -690,7 +705,11 @@ private fun RuleCard(
 @Composable
 private fun RuleEditorDialog(
     existingRule: FilterRule?,
+    savedRules: List<FilterRule>,
     apps: List<InstalledApp>,
+    filteringEnabled: Boolean,
+    activeNotifications: ActiveNotificationsState,
+    loadPreview: RulePreviewLoader,
     onDismiss: () -> Unit,
     onSave: (FilterRule) -> Unit,
 ) {
@@ -712,28 +731,36 @@ private fun RuleEditorDialog(
     var enabled by rememberSaveable(existingRule?.id) {
         mutableStateOf(existingRule?.enabled ?: true)
     }
-    var testText by rememberSaveable(existingRule?.id) { mutableStateOf("") }
     var showAppPicker by rememberSaveable { mutableStateOf(false) }
 
-    val validationError = RuleMatcher.validationError(pattern)
-    val testMatches = if (validationError == null && testText.isNotEmpty()) {
-        val testRule = FilterRule(
-            id = Long.MIN_VALUE,
+    val draft = remember(packageName, pattern, target, action, ignoreCase, enabled, existingRule) {
+        FilterRule(
+            id = existingRule?.id ?: 0L,
+            packageName = packageName.trim().takeIf(String::isNotEmpty),
             pattern = pattern,
             target = target,
-            action = RuleAction.BLOCK,
+            action = action,
             ignoreCase = ignoreCase,
+            enabled = enabled,
+            createdAt = existingRule?.createdAt ?: System.currentTimeMillis(),
         )
-        RuleMatcher.compile(listOf(testRule)).evaluate(
-            NotificationContent(
-                packageName = "test",
-                title = testText,
-                body = testText,
-            ),
-        ).shouldBlock
-    } else {
-        false
     }
+    val validationError = io.github.nvprotas.notifilter.domain.RuleMatcher.validationError(pattern)
+    val previewKey = listOf(savedRules, existingRule, draft, filteringEnabled, activeNotifications)
+    val preview by produceState<RulePreviewResult>(
+        initialValue = RulePreviewResult.Computing,
+        key1 = previewKey,
+    ) {
+        value = RulePreviewResult.Computing
+        value = loadPreview(
+            savedRules,
+            existingRule,
+            draft,
+            filteringEnabled,
+            activeNotifications,
+        )
+    }
+    val predictedRemovals = (preview as? RulePreviewResult.Available)?.removalCount ?: 0
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -811,23 +838,11 @@ private fun RuleEditorDialog(
                     onCheckedChange = { enabled = it },
                 )
 
-                OutlinedTextField(
-                    value = testText,
-                    onValueChange = { testText = it },
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("Тестовая строка (не сохраняется)") },
-                    supportingText = {
-                        if (testText.isNotEmpty() && validationError == null) {
-                            Text(
-                                if (testMatches) "Совпадение найдено" else "Совпадения нет",
-                                color = if (testMatches) {
-                                    MaterialTheme.colorScheme.primary
-                                } else {
-                                    MaterialTheme.colorScheme.onSurfaceVariant
-                                },
-                            )
-                        }
-                    },
+                RulePreviewSection(
+                    preview = preview,
+                    draft = draft,
+                    filteringEnabled = filteringEnabled,
+                    apps = apps,
                 )
             }
         },
@@ -835,20 +850,17 @@ private fun RuleEditorDialog(
             Button(
                 enabled = validationError == null,
                 onClick = {
-                    onSave(
-                        FilterRule(
-                            id = existingRule?.id ?: 0,
-                            packageName = packageName.trim().takeIf(String::isNotEmpty),
-                            pattern = pattern,
-                            target = target,
-                            action = action,
-                            ignoreCase = ignoreCase,
-                            enabled = enabled,
-                            createdAt = existingRule?.createdAt ?: System.currentTimeMillis(),
-                        ),
-                    )
+                    onSave(draft)
                 },
-            ) { Text("Сохранить") }
+            ) {
+                Text(
+                    if (predictedRemovals > 0) {
+                        "Сохранить и скрыть: $predictedRemovals"
+                    } else {
+                        "Сохранить"
+                    },
+                )
+            }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
     )
@@ -863,6 +875,165 @@ private fun RuleEditorDialog(
             },
         )
     }
+}
+
+@Composable
+private fun RulePreviewSection(
+    preview: RulePreviewResult,
+    draft: FilterRule,
+    filteringEnabled: Boolean,
+    apps: List<InstalledApp>,
+) {
+    val labelsByPackage = remember(apps) { apps.associate { it.packageName to it.label } }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("Активные уведомления", style = MaterialTheme.typography.titleSmall)
+        Text(
+            "Предпросмотр ничего не скрывает. Совпавшие push исчезнут только после сохранения включённого правила.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        when (val currentPreview = preview) {
+            RulePreviewResult.Computing -> Text("Проверяем уведомления в шторке…")
+            RulePreviewResult.Unavailable -> Text(
+                "Предпросмотр недоступен. Разрешите Notifilter доступ к уведомлениям.",
+                color = MaterialTheme.colorScheme.error,
+            )
+
+            is RulePreviewResult.Invalid -> Text(
+                "Исправьте регулярное выражение, чтобы увидеть результат.",
+                color = MaterialTheme.colorScheme.error,
+            )
+
+            is RulePreviewResult.Available -> {
+                if (currentPreview.activeCount == 0) {
+                    Text("В системной шторке нет доступных уведомлений.")
+                } else {
+                    Text(
+                        "Совпало: ${currentPreview.directMatchCount} из ${currentPreview.activeCount}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    val outcomeText = when {
+                        !filteringEnabled ->
+                            "Общая фильтрация выключена — после сохранения ничего не исчезнет."
+
+                        !draft.enabled ->
+                            "Правило выключено — совпадения не будут скрыты."
+
+                        draft.action == RuleAction.ALLOW -> {
+                            val newlyAllowed = currentPreview.entries.count {
+                                it.directMatch &&
+                                    it.baselineDecision.shouldBlock &&
+                                    !it.proposedDecision.shouldBlock
+                            }
+                            "Правило разрешит уведомлений: $newlyAllowed"
+                        }
+
+                        else -> "После сохранения исчезнут: ${currentPreview.removalCount}"
+                    }
+                    Text(
+                        outcomeText,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = if (currentPreview.removalCount > 0) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                    )
+
+                    val relevantEntries = currentPreview.entries
+                        .filter { it.directMatch || it.willBeRemoved }
+                        .take(MAX_PREVIEW_SAMPLES)
+                    relevantEntries.forEachIndexed { index, entry ->
+                        if (index > 0) HorizontalDivider()
+                        RulePreviewNotification(
+                            entry = entry,
+                            draft = draft,
+                            filteringEnabled = filteringEnabled,
+                            appLabel = labelsByPackage[entry.sample.content.packageName],
+                        )
+                    }
+                    val relevantCount = currentPreview.entries.count {
+                        it.directMatch || it.willBeRemoved
+                    }
+                    if (relevantCount > relevantEntries.size) {
+                        Text(
+                            "И ещё ${relevantCount - relevantEntries.size}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    if (currentPreview.directMatchCount == 0) {
+                        Text(
+                            "Текущее выражение не совпало ни с одним активным уведомлением.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RulePreviewNotification(
+    entry: RulePreviewEntry,
+    draft: FilterRule,
+    filteringEnabled: Boolean,
+    appLabel: String?,
+) {
+    val content = entry.sample.content
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text(
+            text = appLabel ?: content.packageName,
+            style = MaterialTheme.typography.labelMedium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        if (content.title.isNotBlank()) {
+            Text(
+                content.title,
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (content.body.isNotBlank()) {
+            Text(
+                content.body,
+                style = MaterialTheme.typography.bodySmall,
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Text(
+            previewOutcome(entry, draft, filteringEnabled),
+            style = MaterialTheme.typography.labelSmall,
+            color = if (entry.willBeRemoved) {
+                MaterialTheme.colorScheme.error
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            },
+        )
+    }
+}
+
+private fun previewOutcome(
+    entry: RulePreviewEntry,
+    draft: FilterRule,
+    filteringEnabled: Boolean,
+): String = when {
+    !entry.directMatch && entry.willBeRemoved -> "Будет скрыто другим включённым правилом"
+    !entry.directMatch -> "Нет прямого совпадения с черновиком"
+    !filteringEnabled -> "Совпало, но общая фильтрация выключена"
+    !draft.enabled -> "Совпало, но правило выключено"
+    !entry.sample.eligibleForFiltering -> "Совпало, но это защищённое уведомление"
+    entry.willBeRemoved -> "Исчезнет после сохранения"
+    draft.action == RuleAction.ALLOW -> "Останется видимым благодаря этому исключению"
+    entry.proposedDecision.matchedRuleId != null -> "Останется: сработало правило «Разрешить»"
+    else -> "Совпало, но решение не изменится"
 }
 
 @Composable
@@ -985,3 +1156,5 @@ private enum class MainSection {
     RULES,
     JOURNAL,
 }
+
+private const val MAX_PREVIEW_SAMPLES = 5

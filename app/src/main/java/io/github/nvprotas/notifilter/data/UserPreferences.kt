@@ -1,6 +1,7 @@
 package io.github.nvprotas.notifilter.data
 
 import android.content.Context
+import android.content.SharedPreferences
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
@@ -19,6 +20,29 @@ class UserPreferences(context: Context) {
         preferences.getBoolean(KEY_JOURNAL_ENABLED, false),
     )
     val journalEnabled: StateFlow<Boolean> = _journalEnabled
+
+    private val preferenceChangeListener =
+        SharedPreferences.OnSharedPreferenceChangeListener { sharedPreferences, key ->
+            when (key) {
+                KEY_FILTERING_ENABLED -> {
+                    _filteringEnabled.value = sharedPreferences.getBoolean(
+                        KEY_FILTERING_ENABLED,
+                        false,
+                    )
+                }
+
+                KEY_JOURNAL_ENABLED -> {
+                    _journalEnabled.value = sharedPreferences.getBoolean(
+                        KEY_JOURNAL_ENABLED,
+                        false,
+                    )
+                }
+            }
+        }
+
+    init {
+        preferences.registerOnSharedPreferenceChangeListener(preferenceChangeListener)
+    }
 
     fun isFilteringEnabled(): Boolean =
         preferences.getBoolean(KEY_FILTERING_ENABLED, false)
