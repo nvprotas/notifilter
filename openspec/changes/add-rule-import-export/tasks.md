@@ -22,4 +22,4 @@
 ## 5. Verification
 
 - [x] 5.1 Run strict OpenSpec validation and static source checks without performing a local Android build
-- [ ] 5.2 Publish through `gh`, run GitHub Actions, fix any defects, and confirm the APK artifact is produced
+- [x] 5.2 Publish through `gh`, run GitHub Actions, fix any defects, and confirm the APK artifact is produced
