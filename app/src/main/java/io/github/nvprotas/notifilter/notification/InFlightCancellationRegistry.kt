@@ -2,7 +2,7 @@ package io.github.nvprotas.notifilter.notification
 
 import java.util.concurrent.ConcurrentHashMap
 
-internal class InFlightCancellationRegistry<T>(
+internal class InFlightCancellationRegistry<T : Any>(
     private val createdAtElapsed: (T) -> Long,
 ) {
     private val entries = ConcurrentHashMap<String, T>()

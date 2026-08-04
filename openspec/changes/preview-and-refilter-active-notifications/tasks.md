@@ -25,5 +25,5 @@
 
 - [x] 4.1 Update user-facing documentation and privacy copy to describe ephemeral active-notification preview, immediate application to existing pushes, and the unchanged journal opt-in behavior.
 - [x] 4.2 Perform static review for accidental notification-content persistence or logging and confirm that no Room migration or new Android permission was introduced.
-- [ ] 4.3 Publish implementation changes to GitHub using only `gh`, without running an Android build on this machine.
+- [x] 4.3 Publish implementation changes to GitHub using only `gh`, without running an Android build on this machine.
 - [ ] 4.4 Run and inspect the existing GitHub Actions test, lint, debug APK, and unsigned release APK/AAB jobs; resolve any failures before completing the change.
