@@ -34,4 +34,4 @@
 
 - [x] 5.1 Update README, privacy policy, and interface explanations for allowed-notification persistence, explicit history consent, filter-eligible capture scope, unified exclusions, the broad 4–6 digit default, retention, deletion, and lack of backup/network transfer.
 - [x] 5.2 Perform a static privacy review confirming that excluded or allowed notification content is not written to logs, preferences, saved-instance state, analytics, backup, exports, or any store outside the bounded Room history.
-- [ ] 5.3 Run the existing GitHub Actions Android workflow and verify JVM/Robolectric tests, lint, debug build, and release build; record any platform-level lifecycle ambiguity found during verification without weakening the specified privacy barriers.
+- [x] 5.3 Run the existing GitHub Actions Android workflow and verify JVM/Robolectric tests, lint, debug build, and release build; record any platform-level lifecycle ambiguity found during verification without weakening the specified privacy barriers.
