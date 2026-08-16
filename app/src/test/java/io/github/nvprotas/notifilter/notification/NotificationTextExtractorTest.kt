@@ -4,7 +4,6 @@ import android.app.Notification
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -34,7 +33,7 @@ class NotificationTextExtractorTest {
     }
 
     @Test
-    fun `journal stores only visible title and primary body`() {
+    fun `history uses the same bounded extracted content as filtering`() {
         val notification = Notification.Builder(context, "test")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentTitle("Чат")
@@ -45,10 +44,10 @@ class NotificationTextExtractorTest {
             "Старая история",
         )
 
-        val snapshot = NotificationTextExtractor.journalSnapshot(notification)
+        val content = NotificationTextExtractor.extract("com.example", notification)
 
-        assertEquals("Чат", snapshot.title)
-        assertTrue(snapshot.body.contains("Новое сообщение"))
-        assertFalse(snapshot.body.contains("Старая история"))
+        assertEquals("Чат", content.title)
+        assertTrue(content.body.contains("Новое сообщение"))
+        assertTrue(content.body.contains("Старая история"))
     }
 }

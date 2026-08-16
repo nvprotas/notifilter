@@ -37,15 +37,28 @@ class UserPreferencesTest {
     }
 
     @Test
-    fun `journal change is observed by another preferences instance`() {
+    fun `history change is observed by another preferences instance`() {
         val writer = UserPreferences(context)
         val observer = UserPreferences(context)
 
-        assertFalse(observer.journalEnabled.value)
-        assertTrue(writer.setJournalEnabled(true))
+        assertFalse(observer.historyEnabled.value)
+        assertTrue(writer.setHistoryEnabled(true))
 
-        assertTrue(observer.journalEnabled.value)
-        assertTrue(observer.shouldSaveJournal())
+        assertTrue(observer.historyEnabled.value)
+        assertTrue(observer.isHistoryEnabled())
+    }
+
+    @Test
+    fun `legacy journal consent does not enable broader history`() {
+        context.getSharedPreferences(FILE_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean("journal_enabled", true)
+            .commit()
+
+        val preferences = UserPreferences(context)
+
+        assertFalse(preferences.historyEnabled.value)
+        assertFalse(preferences.isHistoryEnabled())
     }
 
     companion object {

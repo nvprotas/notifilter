@@ -16,10 +16,10 @@ class UserPreferences(context: Context) {
     )
     val filteringEnabled: StateFlow<Boolean> = _filteringEnabled
 
-    private val _journalEnabled = MutableStateFlow(
-        preferences.getBoolean(KEY_JOURNAL_ENABLED, false),
+    private val _historyEnabled = MutableStateFlow(
+        preferences.getBoolean(KEY_HISTORY_ENABLED, false),
     )
-    val journalEnabled: StateFlow<Boolean> = _journalEnabled
+    val historyEnabled: StateFlow<Boolean> = _historyEnabled
 
     private val preferenceChangeListener =
         SharedPreferences.OnSharedPreferenceChangeListener { sharedPreferences, key ->
@@ -31,9 +31,9 @@ class UserPreferences(context: Context) {
                     )
                 }
 
-                KEY_JOURNAL_ENABLED -> {
-                    _journalEnabled.value = sharedPreferences.getBoolean(
-                        KEY_JOURNAL_ENABLED,
+                KEY_HISTORY_ENABLED -> {
+                    _historyEnabled.value = sharedPreferences.getBoolean(
+                        KEY_HISTORY_ENABLED,
                         false,
                     )
                 }
@@ -47,26 +47,26 @@ class UserPreferences(context: Context) {
     fun isFilteringEnabled(): Boolean =
         preferences.getBoolean(KEY_FILTERING_ENABLED, false)
 
-    fun shouldSaveJournal(): Boolean =
-        preferences.getBoolean(KEY_JOURNAL_ENABLED, false)
+    fun isHistoryEnabled(): Boolean =
+        preferences.getBoolean(KEY_HISTORY_ENABLED, false)
 
     fun setFilteringEnabled(value: Boolean) {
         preferences.edit().putBoolean(KEY_FILTERING_ENABLED, value).apply()
         _filteringEnabled.value = value
     }
 
-    fun setJournalEnabled(value: Boolean): Boolean {
-        val saved = preferences.edit().putBoolean(KEY_JOURNAL_ENABLED, value).commit()
-        if (saved) _journalEnabled.value = value
+    fun setHistoryEnabled(value: Boolean): Boolean {
+        val saved = preferences.edit().putBoolean(KEY_HISTORY_ENABLED, value).commit()
+        if (saved) _historyEnabled.value = value
         return saved
     }
 
     companion object {
         private const val FILE_NAME = "notifilter_preferences"
         private const val KEY_FILTERING_ENABLED = "filtering_enabled"
-        private const val KEY_JOURNAL_ENABLED = "journal_enabled"
+        private const val KEY_HISTORY_ENABLED = "history_enabled"
 
-        const val JOURNAL_RETENTION_DAYS = 30
-        const val JOURNAL_MAX_ENTRIES = 1_000
+        const val HISTORY_RETENTION_DAYS = 30
+        const val HISTORY_MAX_ENTRIES = 1_000
     }
 }

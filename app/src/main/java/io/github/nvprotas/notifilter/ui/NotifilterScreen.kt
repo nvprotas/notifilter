@@ -3,6 +3,8 @@ package io.github.nvprotas.notifilter.ui
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -52,6 +54,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
@@ -60,11 +63,13 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import io.github.nvprotas.notifilter.data.BlockedNotificationEntity
-import io.github.nvprotas.notifilter.data.JournalStatus
+import io.github.nvprotas.notifilter.data.HistoryOutcome
+import io.github.nvprotas.notifilter.data.NotificationHistoryEntity
 import io.github.nvprotas.notifilter.data.UserPreferences
 import io.github.nvprotas.notifilter.domain.ActiveNotificationsState
 import io.github.nvprotas.notifilter.domain.FilterRule
+import io.github.nvprotas.notifilter.domain.HistoryExclusion
+import io.github.nvprotas.notifilter.domain.HistoryExclusionValidator
 import io.github.nvprotas.notifilter.domain.MatchTarget
 import io.github.nvprotas.notifilter.domain.RuleAction
 import io.github.nvprotas.notifilter.domain.RulePreviewEntry
@@ -91,8 +96,9 @@ fun NotifilterScreen(
     val apps by viewModel.installedApps.collectAsStateWithLifecycle()
     val filteringEnabled by viewModel.filteringEnabled.collectAsStateWithLifecycle()
     val activeNotifications by viewModel.activeNotifications.collectAsStateWithLifecycle()
-    val journalEnabled by viewModel.journalEnabled.collectAsStateWithLifecycle()
-    val journalEntries by viewModel.journalEntries.collectAsStateWithLifecycle()
+    val historyEnabled by viewModel.historyEnabled.collectAsStateWithLifecycle()
+    val historyEntries by viewModel.historyEntries.collectAsStateWithLifecycle()
+    val historyExclusions by viewModel.historyExclusions.collectAsStateWithLifecycle()
     val ruleImportPreview by viewModel.ruleImportPreview.collectAsStateWithLifecycle()
     val backupOperationInProgress by viewModel.backupOperationInProgress.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
@@ -124,7 +130,7 @@ fun NotifilterScreen(
                             selected = selectedSection == section,
                             onClick = { selectedSection = section },
                             text = {
-                                Text(if (section == MainSection.RULES) "Правила" else "Журнал")
+                                Text(if (section == MainSection.RULES) "Правила" else "История")
                             },
                         )
                     }
@@ -222,13 +228,17 @@ fun NotifilterScreen(
                 item { Spacer(Modifier.height(88.dp)) }
             }
         } else {
-            JournalContent(
-                entries = journalEntries,
+            HistoryContent(
+                entries = historyEntries,
+                exclusions = historyExclusions,
                 apps = apps,
-                journalEnabled = journalEnabled,
-                onJournalEnabledChange = viewModel::setJournalEnabled,
-                onDelete = viewModel::deleteJournalEntry,
-                onClear = viewModel::clearJournal,
+                historyEnabled = historyEnabled,
+                onHistoryEnabledChange = viewModel::setHistoryEnabled,
+                onSaveExclusion = viewModel::saveHistoryExclusion,
+                onSetExclusionEnabled = viewModel::setHistoryExclusionEnabled,
+                onDeleteExclusion = viewModel::deleteHistoryExclusion,
+                onDelete = viewModel::deleteHistoryEntry,
+                onClear = viewModel::clearHistory,
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(contentPadding),
@@ -397,34 +407,40 @@ internal fun ruleImportReplacementMessage(currentRuleCount: Int): String =
     "Замена удалит $currentRuleCount текущих правил и восстановит правила из файла."
 
 @Composable
-private fun JournalContent(
-    entries: List<BlockedNotificationEntity>,
+private fun HistoryContent(
+    entries: List<NotificationHistoryEntity>,
+    exclusions: List<HistoryExclusion>,
     apps: List<InstalledApp>,
-    journalEnabled: Boolean,
-    onJournalEnabledChange: (Boolean) -> Unit,
-    onDelete: (BlockedNotificationEntity) -> Unit,
+    historyEnabled: Boolean,
+    onHistoryEnabledChange: (Boolean) -> Unit,
+    onSaveExclusion: (HistoryExclusion) -> Unit,
+    onSetExclusionEnabled: (HistoryExclusion, Boolean) -> Unit,
+    onDeleteExclusion: (HistoryExclusion) -> Unit,
+    onDelete: (NotificationHistoryEntity) -> Unit,
     onClear: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    var query by rememberSaveable { mutableStateOf("") }
-    var selectedEntry by remember { mutableStateOf<BlockedNotificationEntity?>(null) }
+    // A history search may contain copied notification text; keep it out of saved-instance state.
+    var query by remember { mutableStateOf("") }
+    var selectedEntry by remember { mutableStateOf<NotificationHistoryEntity?>(null) }
     var confirmClear by remember { mutableStateOf(false) }
+    var showExclusions by rememberSaveable { mutableStateOf(false) }
+    var creatingExclusion by remember { mutableStateOf(false) }
+    var editingExclusion by remember { mutableStateOf<HistoryExclusion?>(null) }
+    var deletingExclusion by remember { mutableStateOf<HistoryExclusion?>(null) }
     val labelsByPackage = remember(apps) { apps.associate { it.packageName to it.label } }
+    val selectableApps = remember(apps, entries) {
+        (apps + entries.map { entry ->
+            InstalledApp(
+                packageName = entry.packageName,
+                label = labelsByPackage[entry.packageName] ?: entry.packageName,
+            )
+        })
+            .distinctBy(InstalledApp::packageName)
+            .sortedBy { it.label.lowercase() }
+    }
     val visibleEntries = remember(entries, query, labelsByPackage) {
-        val normalizedQuery = query.trim().lowercase()
-        if (normalizedQuery.isEmpty()) {
-            entries
-        } else {
-            entries.filter { entry ->
-                entry.packageName.lowercase().contains(normalizedQuery) ||
-                    labelsByPackage[entry.packageName]
-                        ?.lowercase()
-                        ?.contains(normalizedQuery) == true ||
-                    entry.title.lowercase().contains(normalizedQuery) ||
-                    entry.body.lowercase().contains(normalizedQuery) ||
-                    entry.matchedRulePattern.lowercase().contains(normalizedQuery)
-            }
-        }
+        filterHistoryEntries(entries, query, labelsByPackage)
     }
 
     LazyColumn(
@@ -439,10 +455,10 @@ private fun JournalContent(
             ) {
                 Column(Modifier.padding(vertical = 6.dp)) {
                     SettingSwitchRow(
-                        title = "Сохранять журнал",
-                        description = "Выключен по умолчанию. Заголовок и основной текст скрываемых уведомлений сохраняются только на устройстве",
-                        checked = journalEnabled,
-                        onCheckedChange = onJournalEnabledChange,
+                        title = "Сохранять историю",
+                        description = "Сохранять на устройстве заголовок и текст новых доступных для фильтрации уведомлений, кроме исключённых",
+                        checked = historyEnabled,
+                        onCheckedChange = onHistoryEnabledChange,
                     )
                     HorizontalDivider(Modifier.padding(horizontal = 16.dp))
                     Row(
@@ -452,7 +468,7 @@ private fun JournalContent(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Text(
-                            text = "До ${UserPreferences.JOURNAL_RETENTION_DAYS} дней, не более ${UserPreferences.JOURNAL_MAX_ENTRIES} записей",
+                            text = "До ${UserPreferences.HISTORY_RETENTION_DAYS} дней, не более ${UserPreferences.HISTORY_MAX_ENTRIES} записей",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.weight(1f),
@@ -462,6 +478,20 @@ private fun JournalContent(
                             enabled = entries.isNotEmpty(),
                         ) { Text("Очистить") }
                     }
+                    OutlinedButton(
+                        onClick = { showExclusions = true },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 6.dp),
+                    ) {
+                        Text("Настроить исключения: ${exclusions.size}")
+                    }
+                    Text(
+                        text = "По умолчанию не сохраняются уведомления с отдельным блоком из 4–6 цифр. Исключения не влияют на показ уведомлений.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                    )
                 }
             }
         }
@@ -473,7 +503,7 @@ private fun JournalContent(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 16.dp),
-                label = { Text("Поиск в журнале") },
+                label = { Text("Поиск в истории") },
                 placeholder = { Text("Приложение, заголовок, текст или правило") },
                 singleLine = true,
             )
@@ -491,16 +521,16 @@ private fun JournalContent(
                 ) {
                     Column(Modifier.padding(20.dp)) {
                         Text(
-                            if (entries.isEmpty()) "Записей журнала пока нет" else "Ничего не найдено",
+                            if (entries.isEmpty()) "История пока пуста" else "Ничего не найдено",
                             style = MaterialTheme.typography.titleMedium,
                         )
                         if (entries.isEmpty()) {
                             Spacer(Modifier.height(4.dp))
                             Text(
-                                if (journalEnabled) {
-                                    "Когда правило запросит скрытие уведомления, его содержимое появится здесь."
+                                if (historyEnabled) {
+                                    "Новые уведомления появятся здесь, если они не совпадут с исключениями."
                                 } else {
-                                    "Включите журнал, чтобы сохранять локальную историю сработавших правил."
+                                    "Включите историю, чтобы сохранять новые уведомления только на этом устройстве."
                                 },
                                 style = MaterialTheme.typography.bodyMedium,
                             )
@@ -509,8 +539,8 @@ private fun JournalContent(
                 }
             }
         } else {
-            items(visibleEntries, key = BlockedNotificationEntity::id) { entry ->
-                JournalEntryCard(
+            items(visibleEntries, key = NotificationHistoryEntity::id) { entry ->
+                HistoryEntryCard(
                     entry = entry,
                     appLabel = labelsByPackage[entry.packageName],
                     onClick = { selectedEntry = entry },
@@ -523,7 +553,7 @@ private fun JournalContent(
     }
 
     selectedEntry?.let { entry ->
-        JournalEntryDialog(
+        HistoryEntryDialog(
             entry = entry,
             appLabel = labelsByPackage[entry.packageName],
             onDismiss = { selectedEntry = null },
@@ -537,8 +567,8 @@ private fun JournalContent(
     if (confirmClear) {
         AlertDialog(
             onDismissRequest = { confirmClear = false },
-            title = { Text("Очистить журнал?") },
-            text = { Text("Все сохранённые уведомления будут удалены из журнала.") },
+            title = { Text("Очистить историю?") },
+            text = { Text("Все сохранённые уведомления будут удалены. Новые продолжат сохраняться, если история включена.") },
             confirmButton = {
                 Button(
                     onClick = {
@@ -552,23 +582,92 @@ private fun JournalContent(
             },
         )
     }
+
+    if (showExclusions) {
+        HistoryExclusionsDialog(
+            exclusions = exclusions,
+            apps = selectableApps,
+            onDismiss = { showExclusions = false },
+            onAdd = {
+                showExclusions = false
+                creatingExclusion = true
+            },
+            onEdit = { rule ->
+                showExclusions = false
+                editingExclusion = rule
+            },
+            onEnabledChange = onSetExclusionEnabled,
+            onDelete = { rule ->
+                showExclusions = false
+                deletingExclusion = rule
+            },
+        )
+    }
+
+    if (creatingExclusion || editingExclusion != null) {
+        HistoryExclusionEditorDialog(
+            existing = editingExclusion,
+            apps = selectableApps,
+            onDismiss = {
+                creatingExclusion = false
+                editingExclusion = null
+                showExclusions = true
+            },
+            onSave = { rule ->
+                onSaveExclusion(rule)
+                creatingExclusion = false
+                editingExclusion = null
+                showExclusions = true
+            },
+        )
+    }
+
+    deletingExclusion?.let { rule ->
+        AlertDialog(
+            onDismissRequest = {
+                deletingExclusion = null
+                showExclusions = true
+            },
+            title = { Text("Удалить исключение?") },
+            text = {
+                Text("Будущие совпадающие уведомления смогут сохраняться в истории. Уже удалённые записи не восстановятся.")
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onDeleteExclusion(rule)
+                        deletingExclusion = null
+                        showExclusions = true
+                    },
+                ) { Text("Удалить исключение") }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        deletingExclusion = null
+                        showExclusions = true
+                    },
+                ) { Text("Отмена") }
+            },
+        )
+    }
 }
 
 @Composable
-private fun JournalEntryCard(
-    entry: BlockedNotificationEntity,
+private fun HistoryEntryCard(
+    entry: NotificationHistoryEntity,
     appLabel: String?,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val formattedTime = remember(entry.blockedAt) {
+    val formattedTime = remember(entry.postedAt) {
         DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
-            .format(Date(entry.blockedAt))
+            .format(Date(entry.postedAt))
     }
     Card(
         modifier = modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick),
+            .clickable(role = Role.Button, onClick = onClick),
     ) {
         Column(Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -604,8 +703,11 @@ private fun JournalEntryCard(
                 )
             }
             Spacer(Modifier.height(10.dp))
+            val status = historyStatusLabel(entry)
             Text(
-                text = "${journalStatusLabel(entry)} · Правило: ${entry.matchedRulePattern}",
+                text = entry.matchedRulePattern?.let { pattern ->
+                    "$status · Правило: $pattern"
+                } ?: status,
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 2,
@@ -616,19 +718,19 @@ private fun JournalEntryCard(
 }
 
 @Composable
-private fun JournalEntryDialog(
-    entry: BlockedNotificationEntity,
+private fun HistoryEntryDialog(
+    entry: NotificationHistoryEntity,
     appLabel: String?,
     onDismiss: () -> Unit,
     onDelete: () -> Unit,
 ) {
-    val formattedTime = remember(entry.blockedAt) {
+    val formattedTime = remember(entry.postedAt) {
         DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.MEDIUM)
-            .format(Date(entry.blockedAt))
+            .format(Date(entry.postedAt))
     }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(entry.title.ifBlank { "Запись журнала" }) },
+        title = { Text(entry.title.ifBlank { "Запись истории" }) },
         text = {
             Column(
                 modifier = Modifier
@@ -651,7 +753,7 @@ private fun JournalEntryDialog(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Text(
-                    text = journalStatusLabel(entry),
+                    text = historyStatusLabel(entry),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -659,18 +761,236 @@ private fun JournalEntryDialog(
                     HorizontalDivider()
                     Text(entry.body, style = MaterialTheme.typography.bodyLarge)
                 }
-                HorizontalDivider()
-                Text("Сработавшее правило", style = MaterialTheme.typography.labelMedium)
-                Text(
-                    text = entry.matchedRulePattern,
-                    fontFamily = FontFamily.Monospace,
-                    style = MaterialTheme.typography.bodyMedium,
-                )
+                entry.matchedRulePattern?.let { pattern ->
+                    HorizontalDivider()
+                    Text("Сработавшее правило", style = MaterialTheme.typography.labelMedium)
+                    Text(
+                        text = pattern,
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
             }
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("Закрыть") } },
         dismissButton = { TextButton(onClick = onDelete) { Text("Удалить запись") } },
     )
+}
+
+@Composable
+private fun HistoryExclusionsDialog(
+    exclusions: List<HistoryExclusion>,
+    apps: List<InstalledApp>,
+    onDismiss: () -> Unit,
+    onAdd: () -> Unit,
+    onEdit: (HistoryExclusion) -> Unit,
+    onEnabledChange: (HistoryExclusion, Boolean) -> Unit,
+    onDelete: (HistoryExclusion) -> Unit,
+) {
+    val labelsByPackage = remember(apps) { apps.associate { it.packageName to it.label } }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Исключения истории") },
+        text = {
+            LazyColumn(
+                modifier = Modifier.heightIn(max = 480.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                item {
+                    Text(
+                        "Совпавшие уведомления не сохраняются. При включении исключения прежние совпадения удаляются.",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+                if (exclusions.isEmpty()) {
+                    item {
+                        Text(
+                            "Исключений пока нет",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                } else {
+                    items(exclusions, key = HistoryExclusion::id) { rule ->
+                        Card(
+                            colors = CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                            ),
+                        ) {
+                            Column(Modifier.padding(12.dp)) {
+                                Row(
+                                    modifier = Modifier.toggleable(
+                                        value = rule.enabled,
+                                        role = Role.Switch,
+                                        onValueChange = { enabled -> onEnabledChange(rule, enabled) },
+                                    ),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text(
+                                            historyExclusionScopeLabel(rule, labelsByPackage),
+                                            style = MaterialTheme.typography.titleSmall,
+                                        )
+                                        rule.pattern?.let { pattern ->
+                                            Text(
+                                                pattern,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                fontFamily = FontFamily.Monospace,
+                                                maxLines = 3,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                        }
+                                    }
+                                    Switch(
+                                        checked = rule.enabled,
+                                        onCheckedChange = null,
+                                    )
+                                }
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.End,
+                                ) {
+                                    TextButton(onClick = { onEdit(rule) }) { Text("Изменить") }
+                                    TextButton(onClick = { onDelete(rule) }) { Text("Удалить") }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { Button(onClick = onAdd) { Text("Добавить исключение") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Закрыть") } },
+    )
+}
+
+@Composable
+private fun HistoryExclusionEditorDialog(
+    existing: HistoryExclusion?,
+    apps: List<InstalledApp>,
+    onDismiss: () -> Unit,
+    onSave: (HistoryExclusion) -> Unit,
+) {
+    var packageName by rememberSaveable(existing?.id) {
+        mutableStateOf(existing?.packageName.orEmpty())
+    }
+    var pattern by rememberSaveable(existing?.id) { mutableStateOf(existing?.pattern.orEmpty()) }
+    var target by rememberSaveable(existing?.id) {
+        mutableStateOf(existing?.target ?: MatchTarget.ALL_TEXT)
+    }
+    var ignoreCase by rememberSaveable(existing?.id) {
+        mutableStateOf(existing?.ignoreCase ?: true)
+    }
+    var enabled by rememberSaveable(existing?.id) { mutableStateOf(existing?.enabled ?: true) }
+    var showAppPicker by rememberSaveable { mutableStateOf(false) }
+    var attemptedSave by rememberSaveable { mutableStateOf(false) }
+    val draft = remember(packageName, pattern, target, ignoreCase, enabled, existing) {
+        HistoryExclusion(
+            id = existing?.id ?: 0L,
+            packageName = packageName.trim().takeIf(String::isNotEmpty),
+            pattern = pattern.trim().takeIf(String::isNotEmpty),
+            target = target,
+            ignoreCase = ignoreCase,
+            enabled = enabled,
+            createdAt = existing?.createdAt ?: System.currentTimeMillis(),
+        )
+    }
+    val validationError = HistoryExclusionValidator.validationError(draft)
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (existing == null) "Новое исключение" else "Изменить исключение") },
+        text = {
+            Column(
+                modifier = Modifier
+                    .heightIn(max = 560.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                OutlinedTextField(
+                    value = packageName,
+                    onValueChange = { packageName = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Пакет приложения") },
+                    placeholder = { Text("Например, com.example.app") },
+                    supportingText = { Text("Оставьте пустым, чтобы проверять все приложения") },
+                    singleLine = true,
+                )
+                OutlinedButton(
+                    onClick = { showAppPicker = true },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Выбрать приложение") }
+                OutlinedTextField(
+                    value = pattern,
+                    onValueChange = { pattern = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Регулярное выражение") },
+                    placeholder = { Text("Например, (?:^|[^0-9])[0-9]{4,6}(?:[^0-9]|$)") },
+                    supportingText = {
+                        Text(
+                            if (attemptedSave && validationError != null) validationError
+                            else "Оставьте пустым, чтобы исключить все уведомления выбранного приложения",
+                        )
+                    },
+                    isError = attemptedSave && validationError != null,
+                    minLines = 2,
+                    maxLines = 4,
+                    textStyle = MaterialTheme.typography.bodyLarge.copy(fontFamily = FontFamily.Monospace),
+                )
+                if (attemptedSave && validationError != null) {
+                    Text(
+                        text = validationError,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+                    )
+                }
+                if (pattern.isNotBlank()) {
+                    Text("Проверять", style = MaterialTheme.typography.titleSmall)
+                    MatchTarget.entries.forEach { option ->
+                        ChoiceRow(
+                            selected = target == option,
+                            label = targetLabel(option),
+                            onClick = { target = option },
+                        )
+                    }
+                    SettingSwitchRow(
+                        title = "Без учёта регистра",
+                        description = "Применяется только к регулярному выражению",
+                        checked = ignoreCase,
+                        onCheckedChange = { ignoreCase = it },
+                    )
+                }
+                SettingSwitchRow(
+                    title = "Исключение включено",
+                    description = "При включении уже сохранённые совпадения будут удалены",
+                    checked = enabled,
+                    onCheckedChange = { enabled = it },
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    attemptedSave = true
+                    if (validationError == null) onSave(draft)
+                },
+            ) { Text("Сохранить исключение") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
+    )
+
+    if (showAppPicker) {
+        AppPickerDialog(
+            apps = apps,
+            onDismiss = { showAppPicker = false },
+            onSelect = { selected ->
+                packageName = selected?.packageName.orEmpty()
+                showAppPicker = false
+            },
+            allAppsSubtitle = "Регулярное выражение действует для всех приложений",
+        )
+    }
 }
 
 @Composable
@@ -698,9 +1018,9 @@ private fun AccessCard(
             Spacer(Modifier.height(6.dp))
             Text(
                 text = if (granted) {
-                    "Сервис в фоне проверяет текст доступных уведомлений. Редактор временно показывает активные push из системной шторки; они не сохраняются. Журнал выключен по умолчанию и записывает только скрытые уведомления после отдельного включения."
+                    "Сервис в фоне проверяет текст доступных уведомлений. Предпросмотр хранится только в памяти. История выключена по умолчанию и после отдельного включения сохраняет на устройстве только уведомления, не совпавшие с исключениями."
                 } else {
-                    "Android попросит разрешить сервису читать активные уведомления, показывать их в предпросмотре и удалять совпавшие. Предпросмотр не сохраняется; журнал включается отдельно и хранится только на устройстве."
+                    "Android попросит разрешить сервису читать активные уведомления, показывать их в предпросмотре и удалять совпавшие. Предпросмотр не сохраняется; история включается отдельно и хранится только на устройстве."
                 },
                 style = MaterialTheme.typography.bodyMedium,
             )
@@ -752,7 +1072,11 @@ private fun SettingSwitchRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable { onCheckedChange(!checked) }
+            .toggleable(
+                value = checked,
+                role = Role.Switch,
+                onValueChange = onCheckedChange,
+            )
             .padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -765,7 +1089,7 @@ private fun SettingSwitchRow(
             )
         }
         Spacer(Modifier.width(12.dp))
-        Switch(checked = checked, onCheckedChange = onCheckedChange)
+        Switch(checked = checked, onCheckedChange = null)
     }
 }
 
@@ -1203,10 +1527,14 @@ private fun ChoiceRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick),
+            .selectable(
+                selected = selected,
+                role = Role.RadioButton,
+                onClick = onClick,
+            ),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        RadioButton(selected = selected, onClick = onClick)
+        RadioButton(selected = selected, onClick = null)
         Text(label)
     }
 }
@@ -1216,6 +1544,7 @@ private fun AppPickerDialog(
     apps: List<InstalledApp>,
     onDismiss: () -> Unit,
     onSelect: (InstalledApp?) -> Unit,
+    allAppsSubtitle: String = "Правило без ограничения по пакету",
 ) {
     var query by remember { mutableStateOf("") }
     val visibleApps = remember(apps, query) {
@@ -1253,7 +1582,7 @@ private fun AppPickerDialog(
                     item {
                         AppPickerRow(
                             title = "Все приложения",
-                            subtitle = "Правило без ограничения по пакету",
+                            subtitle = allAppsSubtitle,
                             onClick = { onSelect(null) },
                         )
                     }
@@ -1303,16 +1632,42 @@ private fun targetLabel(target: MatchTarget): String = when (target) {
     MatchTarget.ALL_TEXT -> "Заголовок и весь текст"
 }
 
-private fun journalStatusLabel(entry: BlockedNotificationEntity): String =
-    if (entry.status == JournalStatus.DISMISS_CONFIRMED.name) {
-        "Android подтвердил скрытие"
-    } else {
-        "Отправлен запрос на скрытие"
+internal fun historyStatusLabel(entry: NotificationHistoryEntity): String = when (entry.outcome) {
+    HistoryOutcome.DISMISS_CONFIRMED.name -> "Android подтвердил скрытие"
+    HistoryOutcome.DISMISS_REQUESTED.name -> "Отправлен запрос на скрытие"
+    else -> "Получено"
+}
+
+internal fun historyExclusionScopeLabel(
+    rule: HistoryExclusion,
+    labelsByPackage: Map<String, String> = emptyMap(),
+): String = rule.packageName?.let { packageName ->
+    labelsByPackage[packageName] ?: packageName
+} ?: "Все приложения"
+
+internal fun filterHistoryEntries(
+    entries: List<NotificationHistoryEntity>,
+    query: String,
+    labelsByPackage: Map<String, String> = emptyMap(),
+): List<NotificationHistoryEntity> {
+    val normalizedQuery = query.trim().lowercase()
+    if (normalizedQuery.isEmpty()) return entries
+    return entries.filter { entry ->
+        entry.packageName.lowercase().contains(normalizedQuery) ||
+            labelsByPackage[entry.packageName]
+                ?.lowercase()
+                ?.contains(normalizedQuery) == true ||
+            entry.title.lowercase().contains(normalizedQuery) ||
+            entry.body.lowercase().contains(normalizedQuery) ||
+            entry.matchedRulePattern
+                ?.lowercase()
+                ?.contains(normalizedQuery) == true
     }
+}
 
 private enum class MainSection {
     RULES,
-    JOURNAL,
+    HISTORY,
 }
 
 private const val MAX_PREVIEW_SAMPLES = 5

@@ -7,16 +7,18 @@ import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.util.Log
 import io.github.nvprotas.notifilter.data.AppDatabase
-import io.github.nvprotas.notifilter.data.BlockedNotificationEntity
-import io.github.nvprotas.notifilter.data.JournalOperationCoordinator
-import io.github.nvprotas.notifilter.data.JournalStatus
+import io.github.nvprotas.notifilter.data.HistoryCaptureAssessment
+import io.github.nvprotas.notifilter.data.HistoryOperationCoordinator
+import io.github.nvprotas.notifilter.data.HistoryOutcome
+import io.github.nvprotas.notifilter.data.HistoryRecordRequest
+import io.github.nvprotas.notifilter.data.HistoryRepository
 import io.github.nvprotas.notifilter.data.UserPreferences
 import io.github.nvprotas.notifilter.data.toDomain
 import io.github.nvprotas.notifilter.domain.ActiveNotificationSample
 import io.github.nvprotas.notifilter.domain.FilterDecision
 import io.github.nvprotas.notifilter.domain.FilterRule
+import io.github.nvprotas.notifilter.domain.NotificationContent
 import io.github.nvprotas.notifilter.domain.RuleMatcher
-import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
@@ -30,7 +32,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.retryWhen
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.withLock
 
 class FilteringNotificationListenerService : NotificationListenerService() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -43,51 +44,56 @@ class FilteringNotificationListenerService : NotificationListenerService() {
         it.createdAtElapsed
     }
     private val listenerConnected = AtomicBoolean(false)
+    private val historyIdentitiesReady = AtomicBoolean(false)
+    private val historyRegistry = ActiveHistoryRegistry()
 
     private lateinit var preferences: UserPreferences
-    private val journalDao by lazy {
-        AppDatabase.get(applicationContext).blockedNotificationDao()
-    }
+    private lateinit var historyRepository: HistoryRepository
 
     override fun onCreate() {
         super.onCreate()
         preferences = UserPreferences(applicationContext)
-        JournalOperationCoordinator.initialize(preferences.shouldSaveJournal())
+        val database = AppDatabase.get(applicationContext)
+        historyRepository = HistoryRepository(database, preferences)
 
-        val dao = AppDatabase.get(applicationContext).filterRuleDao()
+        val ruleDao = database.filterRuleDao()
         serviceScope.launch {
             try {
-                updateMatcher(dao.getEnabled().map { it.toDomain() })
+                updateMatcher(ruleDao.getEnabled().map { it.toDomain() })
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Throwable) {
                 Log.e(TAG, "Unable to load notification rules", error)
             }
 
-            dao.observeEnabled()
+            ruleDao.observeEnabled()
                 .retryWhen { error, attempt ->
                     if (error is CancellationException) throw error
                     Log.e(TAG, "Unable to observe notification rules", error)
-                    delay(
-                        (RULE_RETRY_INITIAL_MILLIS * (attempt + 1L))
-                            .coerceAtMost(RULE_RETRY_MAX_MILLIS),
-                    )
+                    delay(retryDelay(attempt))
                     true
                 }
-                .collect { entities ->
-                    updateMatcher(entities.map { it.toDomain() })
-                }
+                .collect { entities -> updateMatcher(entities.map { it.toDomain() }) }
         }
 
         serviceScope.launch {
-            val now = System.currentTimeMillis()
-            val cutoff = now - journalRetentionMillis()
-            runCatching {
-                JournalOperationCoordinator.mutex.withLock {
-                    journalDao.deleteOlderThan(cutoff)
-                    journalDao.trimToSize(UserPreferences.JOURNAL_MAX_ENTRIES)
+            while (true) {
+                try {
+                    historyRepository.initializePolicy()
+                    historyRepository.observePolicyChanges()
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Throwable) {
+                    HistoryOperationCoordinator.invalidate()
+                    Log.e(TAG, "Unable to load notification history policy", error)
+                    delay(RULE_RETRY_INITIAL_MILLIS)
                 }
-            }.onFailure { error -> Log.w(TAG, "Unable to prune notification journal", error) }
+            }
+        }
+
+        serviceScope.launch {
+            runCatching { historyRepository.pruneHistory() }
+                .onFailure { error -> Log.w(TAG, "Unable to prune notification history", error) }
         }
 
         serviceScope.launch {
@@ -99,16 +105,14 @@ class FilteringNotificationListenerService : NotificationListenerService() {
         }
 
         serviceScope.launch {
-            preferences.filteringEnabled.collect {
-                scheduleRefilter()
-            }
+            preferences.filteringEnabled.collect { scheduleRefilter() }
         }
     }
 
     override fun onNotificationPosted(notification: StatusBarNotification?) {
         val posted = notification ?: return
         refreshActiveNotificationState(postedOverride = posted)
-        evaluateAndCancel(posted)
+        processNotification(posted = posted, postedEvent = true)
     }
 
     private fun updateMatcher(rules: List<FilterRule>) {
@@ -126,18 +130,14 @@ class FilteringNotificationListenerService : NotificationListenerService() {
     }
 
     private fun scheduleRefilter() {
-        val generation = synchronized(matcherUpdateLock) {
-            refilterGeneration.next()
-        }
+        val generation = synchronized(matcherUpdateLock) { refilterGeneration.next() }
         launchRefilter(generation)
     }
 
     private fun launchRefilter(generation: Long) {
         synchronized(refilterJobLock) {
             refilterJob?.cancel()
-            refilterJob = serviceScope.launch {
-                reFilterActiveNotifications(generation)
-            }
+            refilterJob = serviceScope.launch { reFilterActiveNotifications(generation) }
         }
     }
 
@@ -150,64 +150,129 @@ class FilteringNotificationListenerService : NotificationListenerService() {
         active.forEach { posted ->
             currentCoroutineContext().ensureActive()
             if (!refilterGeneration.isCurrent(generation)) return
-            evaluateAndCancel(posted, expectedGeneration = generation)
+            processNotification(
+                posted = posted,
+                postedEvent = false,
+                expectedGeneration = generation,
+            )
         }
     }
 
-    private fun evaluateAndCancel(
+    private fun processNotification(
         posted: StatusBarNotification,
+        postedEvent: Boolean,
         expectedGeneration: Long? = null,
     ) {
+        val eligible = isSafeToFilter(posted)
         val content = NotificationTextExtractor.extract(
             packageName = posted.packageName,
             notification = posted.notification,
         )
-        synchronized(matcherUpdateLock) {
-            if (expectedGeneration != null && !refilterGeneration.isCurrent(expectedGeneration)) return
-            val decision = RuntimeNotificationFilter.blockedDecision(
+        val decision = synchronized(matcherUpdateLock) {
+            if (expectedGeneration != null && !refilterGeneration.isCurrent(expectedGeneration)) {
+                return
+            }
+            RuntimeNotificationFilter.blockedDecision(
                 content = content,
-                eligibleForFiltering = isSafeToFilter(posted),
+                eligibleForFiltering = eligible,
                 filteringEnabled = preferences.isFilteringEnabled(),
                 matcher = matcherState.get().matcher,
-            ) ?: return
-            requestCancellation(posted, decision)
+            )
+        }
+
+        val lifecycle = if (eligible) {
+            historyRegistry.getOrCreate(posted.key, posted.postTime)
+        } else {
+            historyRegistry.remove(posted.key)?.also { event -> deleteHistoryEvent(event.eventId) }
+            null
+        }
+
+        if (decision != null && lifecycle != null) {
+            requestCancellation(posted, content, decision, lifecycle)
+        } else if (postedEvent && lifecycle != null) {
+            recordReceivedOrDeleteExcluded(content, lifecycle)
+        }
+    }
+
+    private fun recordReceivedOrDeleteExcluded(
+        content: NotificationContent,
+        lifecycle: ActiveHistoryEvent,
+    ) {
+        if (!historyIdentitiesReady.get()) return
+        val eventTime = System.currentTimeMillis()
+        when (val assessment = historyRepository.assessCapture(content, eventTime)) {
+            HistoryCaptureAssessment.Excluded -> deleteHistoryEvent(lifecycle.eventId)
+            is HistoryCaptureAssessment.Record -> {
+                HistoryOperationCoordinator.scope.launch {
+                    runCatching {
+                        historyRepository.record(
+                            request = HistoryRecordRequest(
+                                eventId = lifecycle.eventId,
+                                sourceIdentity = lifecycle.sourceIdentity,
+                                content = content,
+                                postedAt = lifecycle.postedAt,
+                                updatedAt = eventTime,
+                                matchedRuleId = null,
+                                matchedRulePattern = null,
+                                outcome = HistoryOutcome.RECEIVED,
+                                active = lifecycle.active.get(),
+                            ),
+                            token = assessment.token,
+                        )
+                    }.onFailure { error -> Log.w(TAG, "Unable to write notification history", error) }
+                }
+            }
+
+            HistoryCaptureAssessment.UnavailableOrDisabled -> Unit
         }
     }
 
     private fun requestCancellation(
         posted: StatusBarNotification,
+        content: NotificationContent,
         decision: FilterDecision,
+        lifecycle: ActiveHistoryEvent,
     ) {
         val eventTime = System.currentTimeMillis()
-        val eventEpoch = JournalOperationCoordinator.currentEpoch()
-        val shouldSaveJournal = preferences.shouldSaveJournal() &&
-            JournalOperationCoordinator.canWrite(eventTime, eventEpoch)
         val pending = PendingCancellation(
-            eventId = UUID.randomUUID().toString(),
-            epoch = eventEpoch,
-            createdAt = eventTime,
+            eventId = lifecycle.eventId,
             createdAtElapsed = SystemClock.elapsedRealtime(),
-            saveJournal = shouldSaveJournal,
         )
         if (!pendingCancellations.tryStart(posted.key, pending)) return
 
-        val journalSnapshot = if (shouldSaveJournal) {
-            NotificationTextExtractor.journalSnapshot(posted.notification)
-        } else {
-            JournalSnapshot.EMPTY
-        }
-
         runCatching { cancelNotification(posted.key) }
             .onSuccess {
-                if (shouldSaveJournal) {
-                    saveToJournal(
-                        packageName = posted.packageName,
-                        pending = pending,
-                        eventTime = pending.createdAt,
-                        snapshot = journalSnapshot,
-                        matchedRuleId = decision.matchedRuleId,
-                        matchedRulePattern = decision.matchedRulePattern.orEmpty(),
-                    )
+                if (!historyIdentitiesReady.get()) return@onSuccess
+                when (val assessment = historyRepository.assessCapture(content, eventTime)) {
+                    HistoryCaptureAssessment.Excluded -> deleteHistoryEvent(lifecycle.eventId)
+                    is HistoryCaptureAssessment.Record -> {
+                        HistoryOperationCoordinator.scope.launch {
+                            runCatching {
+                                historyRepository.record(
+                                    request = HistoryRecordRequest(
+                                        eventId = lifecycle.eventId,
+                                        sourceIdentity = lifecycle.sourceIdentity,
+                                        content = content,
+                                        postedAt = lifecycle.postedAt,
+                                        updatedAt = eventTime,
+                                        matchedRuleId = decision.matchedRuleId,
+                                        matchedRulePattern = decision.matchedRulePattern,
+                                        outcome = if (pending.confirmed.get()) {
+                                            HistoryOutcome.DISMISS_CONFIRMED
+                                        } else {
+                                            HistoryOutcome.DISMISS_REQUESTED
+                                        },
+                                        active = lifecycle.active.get(),
+                                    ),
+                                    token = assessment.token,
+                                )
+                            }.onFailure { error ->
+                                Log.w(TAG, "Unable to write notification history", error)
+                            }
+                        }
+                    }
+
+                    HistoryCaptureAssessment.UnavailableOrDisabled -> Unit
                 }
             }
             .onFailure { error ->
@@ -216,43 +281,10 @@ class FilteringNotificationListenerService : NotificationListenerService() {
             }
     }
 
-    private fun saveToJournal(
-        packageName: String,
-        pending: PendingCancellation,
-        eventTime: Long,
-        snapshot: JournalSnapshot,
-        matchedRuleId: Long?,
-        matchedRulePattern: String,
-    ) {
-        JournalOperationCoordinator.scope.launch {
-            runCatching {
-                JournalOperationCoordinator.mutex.withLock {
-                    if (!preferences.shouldSaveJournal()) return@withLock
-                    if (!JournalOperationCoordinator.canWrite(eventTime, pending.epoch)) {
-                        return@withLock
-                    }
-
-                    val status = if (pending.confirmed.get()) {
-                        JournalStatus.DISMISS_CONFIRMED
-                    } else {
-                        JournalStatus.DISMISS_REQUESTED
-                    }
-                    journalDao.insertAndPrune(
-                        entry = BlockedNotificationEntity(
-                            packageName = packageName,
-                            title = snapshot.title,
-                            body = snapshot.body,
-                            blockedAt = eventTime,
-                            matchedRuleId = matchedRuleId,
-                            matchedRulePattern = matchedRulePattern.take(RuleMatcher.MAX_PATTERN_LENGTH),
-                            notificationFingerprint = pending.eventId,
-                            status = status.name,
-                        ),
-                        cutoff = eventTime - journalRetentionMillis(),
-                        maximumEntries = UserPreferences.JOURNAL_MAX_ENTRIES,
-                    )
-                }
-            }.onFailure { error -> Log.w(TAG, "Unable to write journal entry", error) }
+    private fun deleteHistoryEvent(eventId: String) {
+        HistoryOperationCoordinator.scope.launch {
+            runCatching { historyRepository.deleteEvent(eventId) }
+                .onFailure { error -> Log.w(TAG, "Unable to delete excluded history", error) }
         }
     }
 
@@ -264,38 +296,67 @@ class FilteringNotificationListenerService : NotificationListenerService() {
         super.onNotificationRemoved(notification, rankingMap, reason)
         val removed = notification ?: return
         refreshActiveNotificationState(removedKey = removed.key)
+        val lifecycle = historyRegistry.remove(removed.key)
+        lifecycle?.let { event ->
+            HistoryOperationCoordinator.scope.launch {
+                runCatching { historyRepository.closeEvent(event.eventId) }
+                    .onFailure { error -> Log.w(TAG, "Unable to close notification history event", error) }
+            }
+        }
         if (reason != REASON_LISTENER_CANCEL) return
 
         val pending = pendingCancellations.finish(removed.key) ?: return
         pending.confirmed.set(true)
-        if (!pending.saveJournal) return
-        JournalOperationCoordinator.scope.launch {
-            runCatching {
-                JournalOperationCoordinator.mutex.withLock {
-                    journalDao.updateStatus(pending.eventId, JournalStatus.DISMISS_CONFIRMED.name)
-                }
-            }.onFailure { error -> Log.w(TAG, "Unable to confirm journal entry", error) }
+        HistoryOperationCoordinator.scope.launch {
+            runCatching { historyRepository.confirmRemoval(pending.eventId) }
+                .onFailure { error -> Log.w(TAG, "Unable to confirm history removal", error) }
         }
     }
 
     override fun onListenerConnected() {
         super.onListenerConnected()
         listenerConnected.set(true)
-        refreshActiveNotificationState()
-        scheduleRefilter()
+        historyIdentitiesReady.set(false)
+        val active = readActiveNotifications() ?: return
+        publishActiveNotificationState(active)
+        serviceScope.launch {
+            reconcileHistory(active)
+            historyIdentitiesReady.set(true)
+            scheduleRefilter()
+        }
     }
 
     override fun onListenerDisconnected() {
         listenerConnected.set(false)
-        synchronized(matcherUpdateLock) {
-            refilterGeneration.next()
-        }
+        historyIdentitiesReady.set(false)
+        historyRegistry.clear()
+        synchronized(matcherUpdateLock) { refilterGeneration.next() }
         synchronized(refilterJobLock) {
             refilterJob?.cancel()
             refilterJob = null
         }
         ActiveNotificationCoordinator.publishUnavailable()
         super.onListenerDisconnected()
+    }
+
+    private suspend fun reconcileHistory(active: List<StatusBarNotification>) {
+        val identities = active.associateWith { posted -> notificationSourceIdentity(posted.key) }
+        runCatching { historyRepository.reconcileActiveIdentities(identities.values.toList()) }
+            .onFailure { error -> Log.w(TAG, "Unable to reconcile notification history", error) }
+        identities.forEach { (posted, identity) ->
+            runCatching { historyRepository.findActive(identity) }
+                .getOrNull()
+                ?.let { entry ->
+                    historyRegistry.restore(
+                        posted.key,
+                        ActiveHistoryEvent(
+                            eventId = entry.eventId,
+                            sourceIdentity = identity,
+                            postedAt = entry.postedAt,
+                        ),
+                    )
+                }
+        }
     }
 
     private fun refreshActiveNotificationState(
@@ -360,11 +421,13 @@ class FilteringNotificationListenerService : NotificationListenerService() {
         return applicationInfo.flags and systemFlags != 0
     }
 
-    private fun journalRetentionMillis(): Long =
-        UserPreferences.JOURNAL_RETENTION_DAYS * 24L * 60L * 60L * 1_000L
+    private fun retryDelay(attempt: Long): Long =
+        (RULE_RETRY_INITIAL_MILLIS * (attempt + 1L)).coerceAtMost(RULE_RETRY_MAX_MILLIS)
 
     override fun onDestroy() {
         listenerConnected.set(false)
+        historyIdentitiesReady.set(false)
+        historyRegistry.clear()
         ActiveNotificationCoordinator.publishUnavailable()
         serviceScope.cancel()
         super.onDestroy()
@@ -380,10 +443,7 @@ class FilteringNotificationListenerService : NotificationListenerService() {
 
     private data class PendingCancellation(
         val eventId: String,
-        val epoch: Long,
-        val createdAt: Long,
         val createdAtElapsed: Long,
-        val saveJournal: Boolean,
         val confirmed: AtomicBoolean = AtomicBoolean(false),
     )
 
