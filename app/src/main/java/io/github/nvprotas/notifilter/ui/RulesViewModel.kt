@@ -6,8 +6,8 @@ import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import io.github.nvprotas.notifilter.data.AppDatabase
-import io.github.nvprotas.notifilter.data.BlockedNotificationEntity
-import io.github.nvprotas.notifilter.data.JournalOperationCoordinator
+import io.github.nvprotas.notifilter.data.HistoryRepository
+import io.github.nvprotas.notifilter.data.NotificationHistoryEntity
 import io.github.nvprotas.notifilter.data.RuleBackup
 import io.github.nvprotas.notifilter.data.RuleBackupCodec
 import io.github.nvprotas.notifilter.data.RuleBackupError
@@ -17,6 +17,7 @@ import io.github.nvprotas.notifilter.data.UserPreferences
 import io.github.nvprotas.notifilter.data.functionalKey
 import io.github.nvprotas.notifilter.domain.ActiveNotificationsState
 import io.github.nvprotas.notifilter.domain.FilterRule
+import io.github.nvprotas.notifilter.domain.HistoryExclusion
 import io.github.nvprotas.notifilter.domain.RulePreviewEvaluator
 import io.github.nvprotas.notifilter.domain.RulePreviewResult
 import io.github.nvprotas.notifilter.notification.ActiveNotificationCoordinator
@@ -33,7 +34,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 data class RuleImportPreview(
@@ -52,12 +52,8 @@ class RulesViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = RuleRepository(
         database.filterRuleDao(),
     )
-    private val journalDao = database.blockedNotificationDao()
     private val preferences = UserPreferences(application)
-
-    init {
-        JournalOperationCoordinator.initialize(preferences.shouldSaveJournal())
-    }
+    private val historyRepository = HistoryRepository(database, preferences)
 
     val rules: StateFlow<List<FilterRule>> = repository.rules.stateIn(
         scope = viewModelScope,
@@ -65,11 +61,17 @@ class RulesViewModel(application: Application) : AndroidViewModel(application) {
         initialValue = emptyList(),
     )
     val filteringEnabled: StateFlow<Boolean> = preferences.filteringEnabled
-    val journalEnabled: StateFlow<Boolean> = preferences.journalEnabled
+    val historyEnabled: StateFlow<Boolean> = preferences.historyEnabled
     val activeNotifications: StateFlow<ActiveNotificationsState> =
         ActiveNotificationCoordinator.state
-    val journalEntries: StateFlow<List<BlockedNotificationEntity>> =
-        journalDao.observeSince(System.currentTimeMillis() - journalRetentionMillis()).stateIn(
+    val historyEntries: StateFlow<List<NotificationHistoryEntity>> =
+        historyRepository.observeHistory(System.currentTimeMillis() - historyRetentionMillis()).stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(stopTimeoutMillis = 5_000),
+            initialValue = emptyList(),
+        )
+    val historyExclusions: StateFlow<List<HistoryExclusion>> =
+        historyRepository.exclusions.stateIn(
             scope = viewModelScope,
             started = SharingStarted.WhileSubscribed(stopTimeoutMillis = 5_000),
             initialValue = emptyList(),
@@ -90,7 +92,7 @@ class RulesViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         loadInstalledApps()
-        pruneJournal()
+        initializeHistory()
     }
 
     fun save(rule: FilterRule) {
@@ -231,66 +233,56 @@ class RulesViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun setJournalEnabled(enabled: Boolean) {
-        val changedAt = System.currentTimeMillis()
-        val operationEpoch = JournalOperationCoordinator.suspendWrites(changedAt)
-        JournalOperationCoordinator.scope.launch {
-            try {
-                JournalOperationCoordinator.mutex.withLock {
-                    if (!JournalOperationCoordinator.isCurrent(operationEpoch)) {
-                        return@withLock
-                    }
-                    check(preferences.setJournalEnabled(enabled))
-                }
-            } catch (error: CancellationException) {
-                throw error
-            } catch (_: Throwable) {
-                _messages.emit("Не удалось изменить настройку журнала")
-            } finally {
-                JournalOperationCoordinator.resumeWrites(
-                    enabled = preferences.shouldSaveJournal(),
-                    expectedEpoch = operationEpoch,
-                )
-            }
+    fun setHistoryEnabled(enabled: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { historyRepository.setHistoryEnabled(enabled) }
+                .onFailure { _messages.emit("Не удалось изменить настройку истории") }
         }
     }
 
-    fun deleteJournalEntry(entry: BlockedNotificationEntity) {
-        viewModelScope.launch {
-            runCatching { journalDao.delete(entry) }
+    fun saveHistoryExclusion(rule: HistoryExclusion) {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { historyRepository.saveExclusion(rule) }
+                .onFailure { error ->
+                    _messages.emit(
+                        (error as? IllegalArgumentException)?.message
+                            ?: "Не удалось сохранить исключение истории",
+                    )
+                }
+        }
+    }
+
+    fun setHistoryExclusionEnabled(rule: HistoryExclusion, enabled: Boolean) {
+        saveHistoryExclusion(rule.copy(enabled = enabled))
+    }
+
+    fun deleteHistoryExclusion(rule: HistoryExclusion) {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { historyRepository.deleteExclusion(rule) }
+                .onFailure { _messages.emit("Не удалось удалить исключение истории") }
+        }
+    }
+
+    fun deleteHistoryEntry(entry: NotificationHistoryEntity) {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { historyRepository.deleteHistoryEntry(entry) }
                 .onFailure { _messages.emit("Не удалось удалить запись") }
         }
     }
 
-    fun clearJournal() {
-        val clearedAt = System.currentTimeMillis()
-        val operationEpoch = JournalOperationCoordinator.suspendWrites(clearedAt)
-        JournalOperationCoordinator.scope.launch {
-            try {
-                JournalOperationCoordinator.mutex.withLock {
-                    journalDao.clearJournal(clearedAt)
-                }
-            } catch (error: CancellationException) {
-                throw error
-            } catch (_: Throwable) {
-                _messages.emit("Не удалось очистить журнал")
-            } finally {
-                JournalOperationCoordinator.resumeWrites(
-                    enabled = preferences.shouldSaveJournal(),
-                    expectedEpoch = operationEpoch,
-                )
-            }
+    fun clearHistory() {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { historyRepository.clearHistory() }
+                .onFailure { _messages.emit("Не удалось очистить историю") }
         }
     }
 
-    private fun pruneJournal() {
+    private fun initializeHistory() {
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
-                JournalOperationCoordinator.mutex.withLock {
-                    journalDao.deleteOlderThan(System.currentTimeMillis() - journalRetentionMillis())
-                    journalDao.trimToSize(UserPreferences.JOURNAL_MAX_ENTRIES)
-                }
-            }.onFailure { _messages.emit("Не удалось обновить журнал") }
+                historyRepository.initializePolicy()
+                historyRepository.pruneHistory()
+            }.onFailure { _messages.emit("Не удалось обновить историю") }
         }
     }
 
@@ -322,8 +314,8 @@ class RulesViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun journalRetentionMillis(): Long =
-        UserPreferences.JOURNAL_RETENTION_DAYS * 24L * 60L * 60L * 1_000L
+    private fun historyRetentionMillis(): Long =
+        UserPreferences.HISTORY_RETENTION_DAYS * 24L * 60L * 60L * 1_000L
 
     companion object {
         private const val PREVIEW_DEBOUNCE_MILLIS = 180L

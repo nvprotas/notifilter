@@ -1,8 +1,12 @@
 package io.github.nvprotas.notifilter.notification
 
+import io.github.nvprotas.notifilter.data.HistoryCaptureAssessment
+import io.github.nvprotas.notifilter.data.HistoryOperationCoordinator
 import io.github.nvprotas.notifilter.domain.FilterRule
 import io.github.nvprotas.notifilter.domain.ActiveNotificationSample
 import io.github.nvprotas.notifilter.domain.ActiveNotificationsState
+import io.github.nvprotas.notifilter.domain.HistoryExclusion
+import io.github.nvprotas.notifilter.domain.HistoryExclusionMatcher
 import io.github.nvprotas.notifilter.domain.NotificationContent
 import io.github.nvprotas.notifilter.domain.RuleAction
 import io.github.nvprotas.notifilter.domain.RuleMatcher
@@ -114,6 +118,75 @@ class FilteringServiceLogicTest {
         assertTrue(registry.tryStart("stale", Operation("stale", createdAt = 10L)))
         registry.pruneOlderThan(20L)
         assertTrue(registry.tryStart("stale", Operation("fresh", createdAt = 30L)))
+    }
+
+    @Test
+    fun `history capture fails closed until enabled policy is available`() {
+        HistoryOperationCoordinator.resetForTest()
+        val notification = content("обычное уведомление")
+
+        assertEquals(
+            HistoryCaptureAssessment.UnavailableOrDisabled,
+            HistoryOperationCoordinator.assess(notification, eventTime = 100L),
+        )
+        HistoryOperationCoordinator.publishPolicy(
+            enabled = false,
+            matcher = HistoryExclusionMatcher.EMPTY,
+        )
+        assertEquals(
+            HistoryCaptureAssessment.UnavailableOrDisabled,
+            HistoryOperationCoordinator.assess(notification, eventTime = 101L),
+        )
+        HistoryOperationCoordinator.publishPolicy(
+            enabled = true,
+            matcher = HistoryExclusionMatcher.EMPTY,
+        )
+        assertTrue(
+            HistoryOperationCoordinator.assess(notification, eventTime = 102L) is
+                HistoryCaptureAssessment.Record,
+        )
+        HistoryOperationCoordinator.resetForTest()
+    }
+
+    @Test
+    fun `history exclusion does not become a filtering decision`() {
+        HistoryOperationCoordinator.resetForTest()
+        val exclusionMatcher = HistoryExclusionMatcher.compile(
+            listOf(HistoryExclusion(pattern = "секрет")),
+        ).getOrThrow()
+        HistoryOperationCoordinator.publishPolicy(enabled = true, matcher = exclusionMatcher)
+        val notification = content("секрет")
+
+        assertEquals(
+            HistoryCaptureAssessment.Excluded,
+            HistoryOperationCoordinator.assess(notification, eventTime = 100L),
+        )
+        assertNull(
+            RuntimeNotificationFilter.blockedDecision(
+                content = notification,
+                eligibleForFiltering = true,
+                filteringEnabled = true,
+                matcher = RuleMatcher.EMPTY,
+            ),
+        )
+        HistoryOperationCoordinator.resetForTest()
+    }
+
+    @Test
+    fun `active history registry reuses updates and separates later key reuse`() {
+        val registry = ActiveHistoryRegistry()
+        val first = registry.getOrCreate("android-key", postedAt = 100L)
+        val update = registry.getOrCreate("android-key", postedAt = 200L)
+
+        assertEquals(first.eventId, update.eventId)
+        assertEquals(100L, update.postedAt)
+        assertFalse(first.sourceIdentity.contains("android-key"))
+        assertEquals(first, registry.remove("android-key"))
+        assertFalse(first.active.get())
+
+        val reused = registry.getOrCreate("android-key", postedAt = 300L)
+        assertFalse(first.eventId == reused.eventId)
+        assertEquals(first.sourceIdentity, reused.sourceIdentity)
     }
 
     private fun matcher(vararg rules: FilterRule): RuleMatcher =

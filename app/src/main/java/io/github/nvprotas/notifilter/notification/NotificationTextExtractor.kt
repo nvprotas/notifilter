@@ -16,32 +16,6 @@ object NotificationTextExtractor {
             }
     }
 
-    fun journalSnapshot(notification: Notification): JournalSnapshot = runCatching {
-        val extras = notification.extras ?: Bundle.EMPTY
-        val title = (
-            extras.getCharSequence(Notification.EXTRA_TITLE_BIG)
-                ?: extras.getCharSequence(Notification.EXTRA_TITLE)
-            )
-            ?.toString()
-            ?.trim()
-            .orEmpty()
-            .take(MAX_JOURNAL_TITLE_LENGTH)
-
-        val body = (
-            extras.getCharSequence(Notification.EXTRA_BIG_TEXT)
-                ?: extras.getCharSequence(Notification.EXTRA_TEXT)
-                ?: extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)
-                    ?.take(MAX_TEXT_LINES)
-                    ?.joinToString(separator = "\n")
-            )
-            ?.toString()
-            ?.trim()
-            .orEmpty()
-            .take(MAX_JOURNAL_BODY_LENGTH)
-
-        JournalSnapshot(title = title, body = body)
-    }.getOrDefault(JournalSnapshot.EMPTY)
-
     private fun extractSafely(
         packageName: String,
         notification: Notification,
@@ -87,15 +61,4 @@ object NotificationTextExtractor {
     private const val MAX_PART_LENGTH = 2_048
     private const val MAX_EXTRACTED_TITLE_LENGTH = 2_048
     private const val MAX_EXTRACTED_BODY_LENGTH = 8_192
-    private const val MAX_JOURNAL_TITLE_LENGTH = 1_000
-    private const val MAX_JOURNAL_BODY_LENGTH = 8_000
-}
-
-data class JournalSnapshot(
-    val title: String,
-    val body: String,
-) {
-    companion object {
-        val EMPTY = JournalSnapshot(title = "", body = "")
-    }
 }
